@@ -12,13 +12,19 @@ contract DexRouter {
         factory = DexFactory(_factory);
     }
 
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, "DexRouter: EXPIRED");
+        _;
+    }
+
     // ---------------- Add Liquidity ----------------
     function addLiquidity(
         address tokenA,
         address tokenB,
         uint amountADesired,
-        uint amountBDesired
-    ) external returns (uint amountA, uint amountB, uint liquidity) {
+        uint amountBDesired,
+        uint deadline
+    ) external ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
         address pair = factory.getPair(tokenA, tokenB);
 
         if (pair == address(0)) {
@@ -29,10 +35,35 @@ contract DexRouter {
         IERC20(tokenA).transferFrom(msg.sender, pair, amountADesired);
         IERC20(tokenB).transferFrom(msg.sender, pair, amountBDesired);
 
+        // Sort tokens and amounts to match Pair's internal token0/token1
+        (uint amount0, uint amount1) = tokenA < tokenB ? (amountADesired, amountBDesired) : (amountBDesired, amountADesired);
+
         // Add liquidity
-        liquidity = DexPair(pair).addLiquidity(amountADesired, amountBDesired);
+        liquidity = DexPair(pair).addLiquidity(amount0, amount1, msg.sender);
         amountA = amountADesired;
         amountB = amountBDesired;
+    }
+
+    // ---------------- Remove Liquidity ----------------
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint liquidity,
+        uint amountAMin,
+        uint amountBMin,
+        uint deadline
+    ) external ensure(deadline) returns (uint amountA, uint amountB) {
+        address pair = factory.getPair(tokenA, tokenB);
+        require(pair != address(0), "Pair doesn't exist");
+
+        // Transfer LP tokens from user to pair
+        IERC20(DexPair(pair).lpToken()).transferFrom(msg.sender, pair, liquidity);
+
+        // Remove liquidity
+        (amountA, amountB) = DexPair(pair).removeLiquidity(liquidity);
+
+        require(amountA >= amountAMin, "DexRouter: INSUFFICIENT_A_AMOUNT");
+        require(amountB >= amountBMin, "DexRouter: INSUFFICIENT_B_AMOUNT");
     }
 
     // ---------------- Single Hop Swap ----------------
@@ -40,28 +71,27 @@ contract DexRouter {
         address tokenIn,
         address tokenOut,
         uint amountIn,
-        uint minAmountOut
-    ) external returns (uint amountOut) {
+        uint minAmountOut,
+        uint deadline
+    ) external ensure(deadline) returns (uint amountOut) {
         address pair = factory.getPair(tokenIn, tokenOut);
         require(pair != address(0), "Pair doesn't exist");
 
         // Pull tokens from user
         IERC20(tokenIn).transferFrom(msg.sender, pair, amountIn);
 
-        // Swap
-        amountOut = DexPair(pair).swap(amountIn, tokenIn);
+        // Swap (The pair handles the transfer out to the user)
+        amountOut = DexPair(pair).swap(amountIn, tokenIn, msg.sender);
         require(amountOut >= minAmountOut, "Slippage exceeded");
-
-        // Transfer output to user
-        IERC20(tokenOut).transfer(msg.sender, amountOut);
     }
 
     // ---------------- Multi-Hop Swap ----------------
     function swapExactTokensForTokens(
         uint amountIn,
         uint minAmountOut,
-        address[] calldata path
-    ) external returns (uint[] memory amounts) {
+        address[] calldata path,
+        uint deadline
+    ) external ensure(deadline) returns (uint[] memory amounts) {
         require(path.length >= 2, "Invalid path");
 
         amounts = new uint[](path.length);
@@ -78,18 +108,19 @@ contract DexRouter {
             address pair = factory.getPair(tokenIn, tokenOut);
             require(pair != address(0), "Pair doesn't exist");
 
-            // Swap amount
-            uint amountOut = DexPair(pair).swap(amounts[i], tokenIn);
-            amounts[i + 1] = amountOut;
+            // Destination for the swap output
+            // If it's the last hop, send to user. Otherwise send to next pair.
+            address to = i < path.length - 2 
+                ? factory.getPair(path[i + 1], path[i + 2]) 
+                : msg.sender;
 
-            // For all intermediate hops, the output is already in the pair, no need to transfer
-            // The next pair will pull its input during swap if required
+            uint amountOut = DexPair(pair).swap(amounts[i], tokenIn, to);
+            amounts[i + 1] = amountOut;
         }
 
         require(amounts[amounts.length - 1] >= minAmountOut, "Slippage exceeded");
 
-        // Transfer final token to user
-        IERC20(path[path.length - 1]).transfer(msg.sender, amounts[amounts.length - 1]);
+        // Swap successful - tokens already transferred during loop
     }
 
     // ---------------- TWAP Getter ----------------

@@ -1,0 +1,11 @@
+node_modules
+.env
+__pycache__/
+artifacts/
+cache/
+*.log
+venv/
+.venv/
+nul
+Dex_Mcp/src/dex_mcp/qdrant_db/
+

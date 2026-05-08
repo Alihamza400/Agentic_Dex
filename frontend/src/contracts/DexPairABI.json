@@ -1,5 +1,10 @@
 [
   {
+    "inputs": [],
+    "name": "ReentrancyGuardReentrantCall",
+    "type": "error"
+  },
+  {
     "anonymous": false,
     "inputs": [
       {
@@ -87,6 +92,37 @@
     "type": "event"
   },
   {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": false,
+        "internalType": "uint112",
+        "name": "reserve0",
+        "type": "uint112"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint112",
+        "name": "reserve1",
+        "type": "uint112"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "price0Cumulative",
+        "type": "uint256"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "price1Cumulative",
+        "type": "uint256"
+      }
+    ],
+    "name": "Sync",
+    "type": "event"
+  },
+  {
     "inputs": [
       {
         "internalType": "uint256",
@@ -97,6 +133,11 @@
         "internalType": "uint256",
         "name": "amount1",
         "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "to",
+        "type": "address"
       }
     ],
     "name": "addLiquidity",
@@ -297,6 +338,11 @@
       {
         "internalType": "address",
         "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "internalType": "address",
+        "name": "to",
         "type": "address"
       }
     ],

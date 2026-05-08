@@ -16,7 +16,40 @@ const AIAgentControls = () => {
     successRate: 0
   });
 
-  // Mock function to simulate connecting to AI agent
+  // Fetch real analytics and config from backend
+  useEffect(() => {
+    const fetchAgentData = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8000/Scripts/api_agent.php?action=get_status');
+        const data = await res.json();
+        if (data.status === 'success') {
+          setAnalytics({
+            trades: data.analytics.trades,
+            profit: data.analytics.profit,
+            successRate: data.analytics.successRate
+          });
+          
+          // Sync state with DB config
+          if (data.config) {
+            setIsAgentActive(!!parseInt(data.config.is_active));
+            setStrategy(data.config.strategy);
+            setRiskLevel(data.config.risk_level);
+          }
+
+          if (data.latestDecision && data.latestDecision.action) {
+            setAgentStatus(`Last action: ${data.latestDecision.action} by ${data.latestDecision.agentName}`);
+          }
+        }
+      } catch (e) {
+        console.error("Failed to fetch agent data", e);
+      }
+    };
+
+    fetchAgentData();
+    const interval = setInterval(fetchAgentData, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
   const connectToAgent = async () => {
     if (!account) {
       toast.error('Please connect your wallet first');
@@ -25,48 +58,52 @@ const AIAgentControls = () => {
 
     try {
       setLoading(true);
-      // Simulate connection to AI agent
-      setTimeout(() => {
+      const res = await fetch('http://127.0.0.1:8000/Scripts/api_agent.php?action=set_config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: 1, strategy, risk_level: riskLevel })
+      });
+      const data = await res.json();
+      if (data.status === 'success') {
         setIsAgentActive(true);
         setAgentStatus('running');
-        setLoading(false);
-        toast.success('AI Agent connected successfully!');
-      }, 1500);
+        toast.success('AI Agent connected and activated!');
+      }
+      setLoading(false);
     } catch (error) {
       setLoading(false);
       toast.error('Failed to connect to AI Agent');
     }
   };
 
-  const disconnectAgent = () => {
-    setIsAgentActive(false);
-    setAgentStatus('idle');
-    toast.info('AI Agent disconnected');
+  const disconnectAgent = async () => {
+    try {
+      await fetch('http://127.0.0.1:8000/Scripts/api_agent.php?action=set_config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: 0, strategy, risk_level: riskLevel })
+      });
+      setIsAgentActive(false);
+      setAgentStatus('idle');
+      toast.info('AI Agent deactivated');
+    } catch (e) {
+      toast.error('Failed to disconnect agent');
+    }
   };
 
-  const executeStrategy = () => {
-    if (!isAgentActive) {
-      toast.error('Please connect AI Agent first');
-      return;
+  const executeStrategy = async () => {
+    try {
+      toast.info(`Updating strategy to ${strategy}...`);
+      await fetch('http://127.0.0.1:8000/Scripts/api_agent.php?action=set_config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_active: 1, strategy, risk_level: riskLevel })
+      });
+      toast.success(`Strategy updated! Agent will apply it in the next cycle.`);
+    } catch (e) {
+      toast.error('Failed to update strategy');
     }
-
-    toast.info(`Executing ${strategy} strategy with ${riskLevel} risk level`);
   };
-
-  // Simulate analytics updates
-  useEffect(() => {
-    if (isAgentActive) {
-      const interval = setInterval(() => {
-        setAnalytics(prev => ({
-          trades: prev.trades + Math.floor(Math.random() * 3),
-          profit: prev.profit + (Math.random() * 100 - 50),
-          successRate: Math.min(100, prev.successRate + Math.random() * 2)
-        }));
-      }, 5000);
-
-      return () => clearInterval(interval);
-    }
-  }, [isAgentActive]);
 
   return (
     <motion.div
@@ -84,12 +121,17 @@ const AIAgentControls = () => {
         <div className="bg-gray-700/50 rounded-xl p-6 border border-gray-600">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-xl font-semibold text-gray-300">Agent Status</h3>
-            <div className={`flex items-center space-x-2 px-3 py-1 rounded-full ${
-              isAgentActive ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-            }`}>
+            <div className={`flex items-center space-x-2 px-3 py-1 rounded-full ${isAgentActive ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+              }`}>
               <div className={`w-2 h-2 rounded-full ${isAgentActive ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></div>
               <span className="text-sm font-medium">{isAgentActive ? 'ACTIVE' : 'INACTIVE'}</span>
             </div>
+          </div>
+
+          <div className="mb-6 p-4 bg-gray-800/50 rounded-lg border border-gray-600">
+            <p className="text-sm text-gray-300 font-mono">
+              {agentStatus === 'idle' ? 'Awaiting connection...' : agentStatus}
+            </p>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

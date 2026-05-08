@@ -283,7 +283,7 @@ function AppContent() {
                         transition={{ delay: 0.4 }}
                         className="bg-gradient-to-br from-cyan-600/20 to-blue-600/20 rounded-xl p-6 border border-cyan-500/30 backdrop-blur-sm"
                       >
-                        <h3 className="text-lg font-semibold text-cyan-300 mb-2">Total Value Locked</h3>
+                        <h3 className="text-lg font-semibold text-cyan-300 mb-2">Total Value Locked <span className="text-[10px] opacity-60">(Simulated)</span></h3>
                         <p className="text-3xl font-bold text-white">$1.2M</p>
                         <div className="text-sm text-green-400 mt-1">+12.5% (24h)</div>
                       </motion.div>
@@ -293,7 +293,7 @@ function AppContent() {
                         transition={{ delay: 0.5 }}
                         className="bg-gradient-to-br from-green-600/20 to-emerald-600/20 rounded-xl p-6 border border-green-500/30 backdrop-blur-sm"
                       >
-                        <h3 className="text-lg font-semibold text-green-300 mb-2">24h Volume</h3>
+                        <h3 className="text-lg font-semibold text-green-300 mb-2">24h Volume <span className="text-[10px] opacity-60">(Simulated)</span></h3>
                         <p className="text-3xl font-bold text-white">$456K</p>
                         <div className="text-sm text-green-400 mt-1">+8.3% (24h)</div>
                       </motion.div>

@@ -23,24 +23,25 @@ contract DexFactory is Ownable {
      */
     function createPair(address tokenA, address tokenB) external returns (address pair) {
         require(tokenA != tokenB, "DexFactory: Identical tokens");
-        require(tokenA != address(0) && tokenB != address(0), "DexFactory: Zero address");
-        require(getPair[tokenA][tokenB] == address(0), "DexFactory: Pair exists");
+        (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+        require(token0 != address(0), "DexFactory: Zero address");
+        require(getPair[token0][token1] == address(0), "DexFactory: Pair exists");
 
         // Create new DexPair using CREATE2
-        bytes32 salt = keccak256(abi.encodePacked(tokenA, tokenB));
+        bytes32 salt = keccak256(abi.encodePacked(token0, token1));
         pair = address(new DexPair{salt: salt}());
 
         // Initialize the pair with tokens
-        DexPair(pair).initialize(tokenA, tokenB);
+        DexPair(pair).initialize(token0, token1);
 
         // Store in mapping
-        getPair[tokenA][tokenB] = pair;
-        getPair[tokenB][tokenA] = pair;
+        getPair[token0][token1] = pair;
+        getPair[token1][token0] = pair;
 
         // Add to array of all pairs
         allPairs.push(pair);
 
-        emit PairCreated(tokenA, tokenB, pair, allPairs.length);
+        emit PairCreated(token0, token1, pair, allPairs.length);
     }
 
     /**

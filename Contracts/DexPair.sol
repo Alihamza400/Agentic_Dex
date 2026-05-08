@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "./Token/LP_Token.sol";
 import "./interfaces/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /* ------------------------------------------------------------- */
 /* ----------- Fixed Point Library (from Uniswap V2) ----------- */
@@ -19,7 +20,7 @@ library UQ112x112 {
     }
 }
 
-contract DexPair {
+contract DexPair is ReentrancyGuard {
     address public token0;
     address public token1;
     LPToken public lpToken;
@@ -37,6 +38,7 @@ contract DexPair {
     event Mint(address indexed provider, uint amount0, uint amount1, uint liquidity);
     event Burn(address indexed provider, uint amount0, uint amount1, uint liquidity);
     event Swap(address indexed sender, uint amountIn, uint amountOut);
+    event Sync(uint112 reserve0, uint112 reserve1, uint256 price0Cumulative, uint256 price1Cumulative);
 
     // -------- Initialize Pair --------
     function initialize(address _token0, address _token1) external {
@@ -79,15 +81,14 @@ contract DexPair {
         reserve0 = _r0;
         reserve1 = _r1;
         blockTimestampLast = blockTimestamp;
+        
+        emit Sync(reserve0, reserve1, price0CumulativeLast, price1CumulativeLast);
     }
 
     // -------- Add Liquidity --------
-    function addLiquidity(uint amount0, uint amount1) external returns (uint liquidity) {
+    function addLiquidity(uint amount0, uint amount1, address to) external nonReentrant returns (uint liquidity) {
         require(initialized, "Not initialized");
         require(amount0 > 0 && amount1 > 0, "Invalid amounts");
-
-        IERC20(token0).transferFrom(msg.sender, address(this), amount0);
-        IERC20(token1).transferFrom(msg.sender, address(this), amount1);
 
         (uint112 _r0, uint112 _r1) = getReserves();
 
@@ -102,7 +103,7 @@ contract DexPair {
 
         require(liquidity > 0, "Insufficient liquidity");
 
-        lpToken._mint(msg.sender, liquidity);
+        lpToken._mint(to, liquidity);
 
         _update(_r0 + uint112(amount0), _r1 + uint112(amount1));
 
@@ -112,6 +113,7 @@ contract DexPair {
     // -------- Remove Liquidity --------
     function removeLiquidity(uint liquidity)
         external 
+        nonReentrant
         returns (uint amount0, uint amount1) 
     {
         require(initialized, "Not initialized");
@@ -123,7 +125,7 @@ contract DexPair {
         amount0 = (liquidity * _r0) / _totalSupply;
         amount1 = (liquidity * _r1) / _totalSupply;
 
-        lpToken._burn(msg.sender, liquidity);
+        lpToken._burn(address(this), liquidity);
 
         _update(_r0 - uint112(amount0), _r1 - uint112(amount1));
 
@@ -134,8 +136,9 @@ contract DexPair {
     }
 
     // -------- Swap --------
-    function swap(uint amountIn, address tokenIn)
+    function swap(uint amountIn, address tokenIn, address to)
         external 
+        nonReentrant
         returns (uint amountOut) 
     {
         require(initialized, "Not initialized");
@@ -147,13 +150,11 @@ contract DexPair {
 
         if (isToken0) {
             amountOut = getAmountOut(amountIn, uint(r0), uint(r1));
-            IERC20(token0).transferFrom(msg.sender, address(this), amountIn);
-            IERC20(token1).transfer(msg.sender, amountOut);
+            IERC20(token1).transfer(to, amountOut);
             _update(r0 + uint112(amountIn), r1 - uint112(amountOut));
         } else {
             amountOut = getAmountOut(amountIn, uint(r1), uint(r0));
-            IERC20(token1).transferFrom(msg.sender, address(this), amountIn);
-            IERC20(token0).transfer(msg.sender, amountOut);
+            IERC20(token0).transfer(to, amountOut);
             _update(r0 - uint112(amountOut), r1 + uint112(amountIn));
         }
 

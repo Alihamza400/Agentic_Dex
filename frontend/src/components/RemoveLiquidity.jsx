@@ -3,10 +3,12 @@ import { Web3Context } from "../context/Web3Context.jsx";
 import { ethers } from "ethers";
 import { toast } from "react-toastify";
 import { motion } from "framer-motion";
+import addresses from "../contracts/addresses.json";
 
 export default function RemoveLiquidity() {
   const {
     factory,
+    router,
     account,
     provider,
     createPairContract,
@@ -17,6 +19,8 @@ export default function RemoveLiquidity() {
   const [loading, setLoading] = useState(false);
   const [lpTokenBalance, setLpTokenBalance] = useState("0");
   const [pairInfo, setPairInfo] = useState(null);
+  const [slippage, setSlippage] = useState("0.5");
+  const [minAmounts, setMinAmounts] = useState({ amount0: "0", amount1: "0" });
 
   // Get LP token balance when pair is selected
   useEffect(() => {
@@ -25,7 +29,7 @@ export default function RemoveLiquidity() {
 
       try {
         // First get the LP token address from the pair
-        const pairContract = createPairContract(pairAddress);
+        const pairContract = await createPairContract(pairAddress);
         if (!pairContract) return;
 
         // Get the LP token address from the pair contract
@@ -45,21 +49,37 @@ export default function RemoveLiquidity() {
     fetchLpTokenBalance();
   }, [account, pairAddress, provider, createPairContract, createLPTokenContract]);
 
-  // Get pair info when pair is selected
+  // Calculate expected output and min amounts when LP amount changes
+  useEffect(() => {
+    if (lpTokenAmount && pairInfo && lpTokenBalance !== "0") {
+      const amount = parseFloat(lpTokenAmount);
+      const totalLp = parseFloat(lpTokenBalance); // This is just the user's balance, but we need total supply
+      // Wait, we need the total supply of LP tokens to calculate correctly
+    }
+  }, [lpTokenAmount, pairInfo]);
+
+  // Updated fetchPairInfo to include total supply
   useEffect(() => {
     const fetchPairInfo = async () => {
       if (!pairAddress || !provider) return;
 
       try {
-        const pairContract = createPairContract(pairAddress);
+        const pairContract = await createPairContract(pairAddress);
         if (!pairContract) return;
 
         const [reserve0, reserve1] = await pairContract.getReserves();
         const lpTokenAddr = await pairContract.lpToken();
+        const lpTokenContract = await createLPTokenContract(lpTokenAddr);
+        const totalSupply = await lpTokenContract.totalSupply();
+        const t0 = await pairContract.token0();
+        const t1 = await pairContract.token1();
 
         setPairInfo({
-          reserve0: reserve0.toString(),
-          reserve1: reserve1.toString(),
+          reserve0,
+          reserve1,
+          totalSupply,
+          token0: t0,
+          token1: t1,
           lpTokenAddress: lpTokenAddr
         });
       } catch (error) {
@@ -69,27 +89,59 @@ export default function RemoveLiquidity() {
     };
 
     fetchPairInfo();
-  }, [pairAddress, provider, createPairContract]);
+  }, [pairAddress, provider, createPairContract, createLPTokenContract]);
+
+  // Calculate min amounts
+  useEffect(() => {
+    if (lpTokenAmount && pairInfo) {
+      try {
+        const amountLP = ethers.parseUnits(lpTokenAmount, 18);
+        const expected0 = (amountLP * pairInfo.reserve0) / pairInfo.totalSupply;
+        const expected1 = (amountLP * pairInfo.reserve1) / pairInfo.totalSupply;
+
+        const slip = 1 - parseFloat(slippage) / 100;
+
+        setMinAmounts({
+          amount0: (parseFloat(ethers.formatUnits(expected0, 18)) * slip).toFixed(6),
+          amount1: (parseFloat(ethers.formatUnits(expected1, 18)) * slip).toFixed(6)
+        });
+      } catch (e) {
+        setMinAmounts({ amount0: "0", amount1: "0" });
+      }
+    } else {
+      setMinAmounts({ amount0: "0", amount1: "0" });
+    }
+  }, [lpTokenAmount, pairInfo, slippage]);
 
   const removeLiquidity = async () => {
-    if (!factory || !pairAddress || !lpTokenAmount) {
+    if (!router || !pairAddress || !lpTokenAmount) {
       return toast.error("Please connect wallet, enter pair address and LP token amount");
     }
 
     try {
       setLoading(true);
 
-      // Get the pair contract
-      const pairContract = createPairContract(pairAddress);
-      if (!pairContract) {
-        throw new Error("Could not create pair contract");
-      }
+      const amountLP = ethers.parseUnits(lpTokenAmount, 18);
+      const minA = ethers.parseUnits(minAmounts.amount0, 18);
+      const minB = ethers.parseUnits(minAmounts.amount1, 18);
+      const deadline = Math.floor(Date.now() / 1000) + 60 * 20;
 
-      // Convert amount to proper units (assuming 18 decimals for LP tokens)
-      const amount = ethers.parseUnits(lpTokenAmount, 18);
+      // 1. Approve router to spend LP tokens
+      toast.info("Approving LP tokens...");
+      const lpTokenContract = await createLPTokenContract(pairInfo.lpTokenAddress);
+      const approveTx = await lpTokenContract.approve(addresses.DexRouter, amountLP);
+      await approveTx.wait();
 
-      // Call removeLiquidity on the pair contract
-      const tx = await pairContract.removeLiquidity(amount);
+      // 2. Remove liquidity via router
+      toast.info("Removing liquidity...");
+      const tx = await router.removeLiquidity(
+        pairInfo.token0,
+        pairInfo.token1,
+        amountLP,
+        minA,
+        minB,
+        deadline
+      );
       await tx.wait();
 
       toast.success("Liquidity removed successfully!");
@@ -158,14 +210,12 @@ export default function RemoveLiquidity() {
           {pairInfo && (
             <div className="bg-gray-700/50 rounded-xl p-4 border border-gray-600">
               <div className="space-y-2">
-                <div className="text-sm text-gray-300">Pair Info:</div>
+                <div className="text-sm text-gray-300">Expected Output (Estimated):</div>
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="text-gray-400">Reserve 0:</div>
-                  <div className="text-white truncate">{pairInfo.reserve0.slice(0, 10)}...</div>
-                  <div className="text-gray-400">Reserve 1:</div>
-                  <div className="text-white truncate">{pairInfo.reserve1.slice(0, 10)}...</div>
-                  <div className="text-gray-400">LP Token:</div>
-                  <div className="text-blue-400 text-xs truncate">{pairInfo.lpTokenAddress.slice(0, 10)}...</div>
+                  <div className="text-gray-400">Token 0:</div>
+                  <div className="text-white">{minAmounts.amount0} (min)</div>
+                  <div className="text-gray-400">Token 1:</div>
+                  <div className="text-white">{minAmounts.amount1} (min)</div>
                 </div>
               </div>
             </div>
@@ -176,10 +226,10 @@ export default function RemoveLiquidity() {
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={removeLiquidity}
-            disabled={loading || !factory}
-            className={`w-full py-4 rounded-xl text-white font-semibold text-lg transition-all ${loading || !factory
-                ? "bg-gray-600 cursor-not-allowed"
-                : "bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 shadow-lg"
+            disabled={loading || !router || !pairInfo || !lpTokenAmount}
+            className={`w-full py-4 rounded-xl text-white font-semibold text-lg transition-all ${loading || !router || !pairInfo || !lpTokenAmount
+              ? "bg-gray-600 cursor-not-allowed"
+              : "bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 shadow-lg"
               }`}
           >
             {loading ? (
