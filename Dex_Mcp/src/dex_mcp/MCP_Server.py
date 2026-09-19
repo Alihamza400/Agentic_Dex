@@ -101,7 +101,13 @@ class DatabaseUnavailable(RuntimeError):
 async def get_pool() -> aiomysql.Pool:
     global _pool
     if _pool is None:
-        _pool = await aiomysql.create_pool(**DB_CONFIG, minsize=1, maxsize=5)
+        try:
+            _pool = await asyncio.wait_for(
+                aiomysql.create_pool(**DB_CONFIG, minsize=1, maxsize=5),
+                timeout=3.0,
+            )
+        except (asyncio.TimeoutError, Exception) as exc:
+            raise DatabaseUnavailable(f"MySQL unreachable: {exc}") from exc
     return _pool
 
 

@@ -24,6 +24,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import aiomysql
 from dotenv import load_dotenv
@@ -59,11 +60,11 @@ from dex_mcp.MCP_Server import (
 load_dotenv()
 
 MAX_TOOL_ROUNDS = 2
+STATE_DIR = Path(__file__).resolve().parents[3] / ".agent_state"
+STATE_FILE = STATE_DIR / "state.json"
 
-SYSTEM_INSTRUCTION = """Senior Quant Orchestrator. OODA loop: Observe→Orient→Decide→Act.
-Tools: get_pool_addresses, get_market_context, get_balances, execute_trade, execute_arbitrage.
-Rules: max 10% wallet per trade, 1% slippage, only trade on clear positive edge after 0.3% fee.
-Reply with: DECISION (HOLD/TRADE/ARB), amounts in wei, reasoning."""
+SYSTEM_INSTRUCTION = """Quant agent. Read pool data, decide HOLD or TRADE.
+Reply JSON: {"action":"HOLD"|"TRADE","token_in":"...","token_out":"...","amount":"...","reason":"..."}"""
 
 # ── Tool registry (name -> async callable) ────────────────────────────────────
 TOOLS = {
@@ -101,8 +102,22 @@ async def call_tool(name: str, args: dict) -> dict | list:
 async def read_agent_config() -> dict:
     """Strategy/risk/active flags set from the frontend; sensible defaults if the DB is down."""
     default = {"strategy": "arbitrage", "risk_level": "medium", "is_active": 1}
+
+    # First try the local JSON state file (written by the Node.js backend)
+    state_file = Path(__file__).resolve().parents[3] / ".agent_state" / "state.json"
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text())
+            cfg = data.get("config", {})
+            if cfg:
+                return {**default, **{k: v for k, v in cfg.items() if v is not None}}
+        except Exception:
+            pass
+
+    # Fall back to MySQL
     try:
-        pool = await get_pool()
+        import asyncio
+        pool = await asyncio.wait_for(get_pool(), timeout=3.0)
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute("SELECT * FROM agent_config WHERE id = 1")
@@ -124,9 +139,9 @@ async def collect_market_data() -> dict:
     compact_pools = []
     for p in (pools if isinstance(pools, list) else []):
         compact_pools.append({
-            "pair": p.get("pairAddress", "?"),
-            "t0": p.get("token0Symbol", "?"),
-            "t1": p.get("token1Symbol", "?"),
+            "pair": p.get("pairAddress") or p.get("pair", "?"),
+            "t0": p.get("token0Symbol") or p.get("symbol0", "?"),
+            "t1": p.get("token1Symbol") or p.get("symbol1", "?"),
             "r0": p.get("reserve0", "0"),
             "r1": p.get("reserve1", "0"),
             "price": p.get("spotPrice", "0"),
@@ -151,9 +166,10 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
 
     data = await collect_market_data()
     prompt = (
-        f"{json.dumps(data, default=str)}\n"
+        f"Pools: {json.dumps(data['pools'][:3], default=str)[:500]}\n"
+        f"Balances: {json.dumps(data['wallet_balances'], default=str)[:200]}\n"
         f"Strategy={strategy} Risk={risk}\n"
-        "If arbitrage exists, execute it. Otherwise HOLD."
+        "DECIDE: HOLD or execute trade. Reply JSON: {\"action\":\"HOLD\"|\"TRADE\",\"reason\":\"...\"}"
     )
 
     messages = [
@@ -170,31 +186,15 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
             "type": "function",
             "function": {
                 "name": "get_pool_addresses",
-                "description": "List all trading pairs with token symbols and addresses.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_market_context",
-                "description": "Latest reserves, spot price for every pair.",
-                "parameters": {"type": "object", "properties": {}, "required": []},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_balances",
-                "description": "Wallet token balances (human-readable).",
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "description": "List trading pairs.",
+                "parameters": {"type": "object", "properties": {}},
             },
         },
         {
             "type": "function",
             "function": {
                 "name": "execute_trade",
-                "description": "Swap token_in for token_out on-chain. Amounts in wei.",
+                "description": "Swap tokens on-chain.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -203,22 +203,6 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
                         "amount_in": {"type": "string"},
                     },
                     "required": ["token_in", "token_out", "amount_in"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "execute_arbitrage",
-                "description": "Multi-hop swap path. Amounts in wei.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "array", "items": {"type": "string"}},
-                        "amount_in": {"type": "string"},
-                        "min_amount_out": {"type": "string"},
-                    },
-                    "required": ["path", "amount_in"],
                 },
             },
         },
@@ -231,7 +215,7 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
             messages=messages,
             tools=openai_tools,
             tool_choice="auto",
-            max_tokens=400,
+            max_tokens=150,
         )
     )
 
@@ -262,7 +246,7 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
                 messages=messages,
                 tools=openai_tools,
                 tool_choice="auto",
-                max_tokens=400,
+                max_tokens=150,
             )
         )
 
@@ -280,6 +264,23 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
         confidence=1.0,
         context={"strategy": strategy, "risk": risk, "toolCalls": tool_calls},
     )
+
+    # Also write to shared JSON state so the frontend backend can see it
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {"config": {}, "decisions": [], "trades": []}
+        state["decisions"].append({
+            "agentName": "Quant_Orchestrator",
+            "action": "QUANT_ANALYSIS",
+            "reason": summary[:4000],
+            "confidence": 1.0,
+            "contextJSON": {"strategy": strategy, "risk": risk},
+            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        state["decisions"] = state["decisions"][-100:]
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+    except Exception:
+        pass
 
 
 async def process_agent_loop() -> None:
@@ -299,7 +300,11 @@ async def process_agent_loop() -> None:
     try:
         await run_llm_cycle(strategy, risk)
     except Exception as exc:  # noqa: BLE001 - one bad cycle must not kill the agent
-        print(f"!!! Cycle error: {type(exc).__name__}: {exc}")
+        err = str(exc)
+        if "402" in err:
+            print(f"[{time.strftime('%H:%M:%S')}] OpenRouter credits exhausted. Add credits at https://openrouter.ai/settings/credits")
+        else:
+            print(f"!!! Cycle error: {type(exc).__name__}: {exc}")
 
 
 async def self_test() -> int:

@@ -8,4 +8,5 @@ venv/
 .venv/
 nul
 Dex_Mcp/src/dex_mcp/qdrant_db/
+.agent_state/
 

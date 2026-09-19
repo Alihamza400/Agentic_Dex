@@ -56,6 +56,7 @@
     "index": "node Scripts/sync.js",
     "index:once": "node Scripts/sync.js --once",
     "api": "php -S 127.0.0.1:8000 -t .",
+    "agent:server": "node Scripts/agent_server.js",
     "agent": "cd Dex_Mcp && uv run dex-agent",
     "mcp": "cd Dex_Mcp && uv run dex-mcp",
     "agents:setup": "cd Dex_Mcp && uv sync",
