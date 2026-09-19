@@ -111,15 +111,19 @@ contract DexPair is ReentrancyGuard {
     }
 
     // -------- Remove Liquidity --------
-    function removeLiquidity(uint liquidity)
+    // `to` receives the underlying tokens: the caller (usually the Router) holds
+    // the LP tokens, so the proceeds must be forwarded explicitly to the user.
+    function removeLiquidity(uint liquidity, address to)
         external 
         nonReentrant
         returns (uint amount0, uint amount1) 
     {
         require(initialized, "Not initialized");
         require(liquidity > 0, "Invalid liquidity");
+        require(to != address(0), "Invalid recipient");
 
         uint _totalSupply = lpToken.totalSupply();
+        require(_totalSupply > 0, "No liquidity tokens");
         (uint112 _r0, uint112 _r1) = getReserves();
 
         amount0 = (liquidity * _r0) / _totalSupply;
@@ -129,8 +133,8 @@ contract DexPair is ReentrancyGuard {
 
         _update(_r0 - uint112(amount0), _r1 - uint112(amount1));
 
-        IERC20(token0).transfer(msg.sender, amount0);
-        IERC20(token1).transfer(msg.sender, amount1);
+        IERC20(token0).transfer(to, amount0);
+        IERC20(token1).transfer(to, amount1);
 
         emit Burn(msg.sender, amount0, amount1, liquidity);
     }
@@ -147,6 +151,13 @@ contract DexPair is ReentrancyGuard {
 
         (uint112 r0, uint112 r1) = getReserves();
         bool isToken0 = tokenIn == token0;
+
+        // Safety: the caller must have actually delivered `amountIn` of tokenIn to
+        // this pair before calling swap. Without this check anyone could call swap
+        // directly with an arbitrary amountIn and drain the reserves.
+        uint reserveIn = isToken0 ? uint(r0) : uint(r1);
+        uint balanceIn = IERC20(tokenIn).balanceOf(address(this));
+        require(balanceIn >= reserveIn + amountIn, "DexPair: INSUFFICIENT_INPUT_AMOUNT");
 
         if (isToken0) {
             amountOut = getAmountOut(amountIn, uint(r0), uint(r1));

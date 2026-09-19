@@ -25,23 +25,41 @@ contract DexRouter {
         uint amountBDesired,
         uint deadline
     ) external ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+        require(tokenA != tokenB, "DexRouter: IDENTICAL_TOKENS");
+        require(amountADesired > 0 && amountBDesired > 0, "DexRouter: ZERO_AMOUNT");
+
         address pair = factory.getPair(tokenA, tokenB);
 
         if (pair == address(0)) {
             pair = factory.createPair(tokenA, tokenB);
         }
 
-        // Pull tokens from user
-        IERC20(tokenA).transferFrom(msg.sender, pair, amountADesired);
-        IERC20(tokenB).transferFrom(msg.sender, pair, amountBDesired);
+        bool isToken0A = tokenA < tokenB;
+        (uint amount0, uint amount1) = isToken0A
+            ? (amountADesired, amountBDesired)
+            : (amountBDesired, amountADesired);
 
-        // Sort tokens and amounts to match Pair's internal token0/token1
-        (uint amount0, uint amount1) = tokenA < tokenB ? (amountADesired, amountBDesired) : (amountBDesired, amountADesired);
+        // Match the existing pool ratio so no value is donated to existing LPs.
+        (uint112 r0, uint112 r1) = DexPair(pair).getReserves();
+        if (r0 > 0 && r1 > 0) {
+            uint amount1Optimal = (amount0 * r1) / r0;
+            if (amount1Optimal <= amount1) {
+                amount1 = amount1Optimal;
+            } else {
+                uint amount0Optimal = (amount1 * r0) / r1;
+                require(amount0Optimal <= amount0, "DexRouter: INSUFFICIENT_A_AMOUNT");
+                amount0 = amount0Optimal;
+            }
+        }
+
+        (amountA, amountB) = isToken0A ? (amount0, amount1) : (amount1, amount0);
+
+        // Pull only the amounts that will actually be used
+        IERC20(tokenA).transferFrom(msg.sender, pair, amountA);
+        IERC20(tokenB).transferFrom(msg.sender, pair, amountB);
 
         // Add liquidity
         liquidity = DexPair(pair).addLiquidity(amount0, amount1, msg.sender);
-        amountA = amountADesired;
-        amountB = amountBDesired;
     }
 
     // ---------------- Remove Liquidity ----------------
@@ -55,12 +73,17 @@ contract DexRouter {
     ) external ensure(deadline) returns (uint amountA, uint amountB) {
         address pair = factory.getPair(tokenA, tokenB);
         require(pair != address(0), "Pair doesn't exist");
+        require(liquidity > 0, "DexRouter: ZERO_LIQUIDITY");
 
         // Transfer LP tokens from user to pair
         IERC20(DexPair(pair).lpToken()).transferFrom(msg.sender, pair, liquidity);
 
-        // Remove liquidity
-        (amountA, amountB) = DexPair(pair).removeLiquidity(liquidity);
+        // Remove liquidity - the pair always returns (amount0, amount1)
+        // and forwards the underlying tokens directly to the user.
+        (uint amount0, uint amount1) = DexPair(pair).removeLiquidity(liquidity, msg.sender);
+
+        // Map back to the caller's (tokenA, tokenB) ordering before slippage checks
+        (amountA, amountB) = tokenA < tokenB ? (amount0, amount1) : (amount1, amount0);
 
         require(amountA >= amountAMin, "DexRouter: INSUFFICIENT_A_AMOUNT");
         require(amountB >= amountBMin, "DexRouter: INSUFFICIENT_B_AMOUNT");
