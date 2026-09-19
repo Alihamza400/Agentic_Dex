@@ -19,8 +19,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
 const STATE_DIR = join(PROJECT_ROOT, ".agent_state");
 const STATE_FILE = join(STATE_DIR, "state.json");
+const DATA_DIR = join(PROJECT_ROOT, "data");
+const POOLS_DIR = join(DATA_DIR, "pool_snapshots");
+const DECISIONS_DIR = join(DATA_DIR, "agent_decisions");
+const MARKET_DIR = join(DATA_DIR, "market_context");
 
 if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(POOLS_DIR)) mkdirSync(POOLS_DIR, { recursive: true });
+if (!existsSync(DECISIONS_DIR)) mkdirSync(DECISIONS_DIR, { recursive: true });
+if (!existsSync(MARKET_DIR)) mkdirSync(MARKET_DIR, { recursive: true });
 
 // ── Load ABIs + addresses ─────────────────────────────────────────────
 function loadJson(path) {
@@ -63,6 +71,40 @@ function loadState() {
 
 function saveState(state) {
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ── Persistent pool data ──────────────────────────────────────────────
+function savePoolSnapshot(poolData) {
+  const blockNumber = poolData.blockNumber;
+  const filePath = join(POOLS_DIR, `${blockNumber}.json`);
+  // Read existing data and append
+  let existing = [];
+  if (existsSync(filePath)) {
+    try {
+      existing = JSON.parse(readFileSync(filePath, "utf-8"));
+    } catch {
+      existing = [];
+    }
+  }
+  // Avoid duplicate block numbers
+  if (!existing.some((e) => e.blockNumber === blockNumber)) {
+    existing.push(poolData);
+    // Keep only last 1000 entries to prevent unbounded growth
+    existing = existing.slice(-1000);
+  }
+  writeFileSync(filePath, JSON.stringify(existing, null, 2));
+}
+
+function getPoolSnapshots(blockNumber) {
+  const filePath = join(POOLS_DIR, `${blockNumber}.json`);
+  if (existsSync(filePath)) {
+    try {
+      return JSON.parse(readFileSync(filePath, "utf-8"));
+    } catch {
+      return [];
+  }
+  }
+  return [];
 }
 
 // ── Blockchain helpers ────────────────────────────────────────────────
@@ -311,6 +353,8 @@ async function handleRequest(req, res) {
         for (const addr of pairAddresses) {
           const state = await getPairState(addr);
           pools.push(state);
+          // Persist pool snapshot
+          savePoolSnapshot(state);
         }
 
         const recentSwaps = await getRecentSwaps(20);

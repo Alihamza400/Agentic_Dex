@@ -131,33 +131,76 @@ async def read_agent_config() -> dict:
 
 
 async def collect_market_data() -> dict:
-    """Everything the agent needs, gathered from the MCP tool layer."""
-    market = await call_tool("get_market_context", {})
-    pools = await call_tool("get_pool_addresses", {})
-    balances = await call_tool("get_balances", {})
+    """Everything the agent needs, gathered from persisted pool data."""
+    import json
+    from pathlib import Path
 
-    # Use market context for reserves/price (has live data), pool_addresses for symbols
+    data_dir = Path(__file__).resolve().parents[3] / "data"
+
+    # Read pool snapshots from JSON files
+    pools = []
+    pools_dir = data_dir / "pool_snapshots"
+    if pools_dir.exists():
+        for f in sorted(pools_dir.glob("*.json")):
+            try:
+                entry = json.loads(f.read_text())
+                # entry is a list, take the latest
+                if entry:
+                    pools.append(entry[-1])
+            except Exception:
+                continue
+
+    # Read agent decisions from JSON
+    decisions_file = data_dir / "agent_decisions" / "state.json"
+    decisions = []
+    if decisions_file.exists():
+        try:
+            decisions = json.loads(decisions_file.read_text())
+        except Exception:
+            pass
+
+    # Read market context (pools + reserves) from JSON
+    market_context = []
+    market_file = data_dir / "market_context" / "context.json"
+    if market_file.exists():
+        try:
+            market_context = json.loads(market_file.read_text())
+        except Exception:
+            pass
+
+    # Build compact pool list from snapshots
     symbol_map = {}
-    for p in (pools if isinstance(pools, list) else []):
-        addr = p.get("pair") or p.get("pairAddress", "")
-        symbol_map[addr.lower()] = p
+    for p in pools:
+        addr = p.get("pair", "").lower()
+        if addr:
+            symbol_map[addr] = {
+                "symbol0": p.get("token0Symbol", "?"),
+                "symbol1": p.get("token1Symbol", "?"),
+                "reserve0": p.get("reserve0", "0"),
+                "reserve1": p.get("reserve1", "0"),
+                "spotPrice": p.get("spotPrice", "0"),
+            }
 
     compact_pools = []
-    for m in (market if isinstance(market, list) else []):
+    for m in market_context:
         addr = m.get("pairAddress") or m.get("pair", "")
         info = symbol_map.get(addr.lower(), {})
         compact_pools.append({
             "pair": addr,
-            "t0": info.get("symbol0") or info.get("token0Symbol", "?"),
-            "t1": info.get("symbol1") or info.get("token1Symbol", "?"),
-            "r0": m.get("reserve0", "0"),
-            "r1": m.get("reserve1", "0"),
-            "price": m.get("spotPrice", "0"),
+            "t0": info.get("symbol0", "?"),
+            "t1": info.get("symbol1", "?"),
+            "r0": info.get("reserve0", "0"),
+            "r1": info.get("reserve1", "0"),
+            "price": info.get("spotPrice", "0"),
         })
+
+    # Read wallet balances from the MCP tool layer
+    balances = await call_tool("get_balances", {})
 
     return {
         "pools": compact_pools,
         "wallet_balances": balances,
+        "decision_context": decisions,
     }
 
 

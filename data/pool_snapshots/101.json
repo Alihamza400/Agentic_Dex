@@ -1,0 +1,17 @@
+[
+  {
+    "pair": "0xACbB3a80dEF3f0A24FF6Df771B79c92DaDba25D0",
+    "token0": "0x9a28D3397C6F29549da03d5754bF03414b966Be2",
+    "token1": "0xf6776879082f3D31B7E5F8D380A07B799beBf18E",
+    "token0Symbol": "0x9a28D3",
+    "token1Symbol": "0xf67768",
+    "reserve0": "6001000000000000000000",
+    "reserve1": "4168058519007935359538",
+    "spotPrice": "694560659724701776",
+    "price0Cumulative": "24721099638451789791778182102910313652",
+    "price1Cumulative": "24740724154575533499661784662682469700",
+    "blockNumber": 101,
+    "timestamp": 1789811619,
+    "source": "chain"
+  }
+]
