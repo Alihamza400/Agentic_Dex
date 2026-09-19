@@ -1,12 +1,5 @@
-import { saveAbi } from "./update-frontend.js";
+import { saveAllAbis } from "./update-frontend.js";
 
-// Generate all ABIs that may be needed by the frontend
-console.log("Generating all contract ABIs for frontend...");
-
-saveAbi("DexFactory");
-saveAbi("DexRouter");
-saveAbi("DexPair");
-saveAbi("LPToken");
-saveAbi("TestToken");
-
+console.log("Generating all contract ABIs for the frontend...");
+saveAllAbis();
 console.log("All ABIs generated successfully!");

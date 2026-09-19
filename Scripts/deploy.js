@@ -1,31 +1,45 @@
 import pkg from "hardhat";
 const { ethers } = pkg;
 
-import { saveAbi, saveAddress } from"./update-frontend.js";
+import { saveAddress, saveAllAbis } from "./update-frontend.js";
+import { writeEnv } from "./env.js";
 
 async function main() {
+  const [deployer] = await ethers.getSigners();
+  const net = await ethers.provider.getNetwork();
+
+  console.log(`Deploying to network "${net.name}" (chainId ${net.chainId}) as ${deployer.address}`);
+
   console.log("Deploying Factory...");
   const Factory = await ethers.deployContract("DexFactory");
   await Factory.waitForDeployment();
-  console.log("Factory deployed at:", Factory.target);
-
-  saveAbi("DexFactory");
-  saveAddress("DexFactory", Factory.target);
+  const factoryAddress = await Factory.getAddress();
+  console.log("Factory deployed at:", factoryAddress);
+  saveAddress("DexFactory", factoryAddress);
 
   console.log("Deploying Router...");
-  const Router = await ethers.deployContract("DexRouter", [Factory.target]);
+  const Router = await ethers.deployContract("DexRouter", [factoryAddress]);
   await Router.waitForDeployment();
-  console.log("Router deployed at:", Router.target);
+  const routerAddress = await Router.getAddress();
+  console.log("Router deployed at:", routerAddress);
+  saveAddress("DexRouter", routerAddress);
 
-  saveAbi("DexRouter");
-  saveAddress("DexRouter", Router.target);
+  // ABIs for every contract the frontend/agents touch
+  saveAllAbis();
 
-  // Save ABIs for other contracts that may be needed by the frontend
-  saveAbi("DexPair");
-  saveAbi("LPToken"); // From Token/LP_Token.sol
-  saveAbi("TestToken"); // For test tokens
+  // Share the deployment with the indexer + Python agents
+  writeEnv({
+    Factory_Address: factoryAddress,
+    Router_Address: routerAddress,
+  });
 
-  console.log("Factory deployed with open pair creation enabled.");
+  console.log(`\nFactory: ${factoryAddress}`);
+  console.log(`Router:  ${routerAddress}`);
+  console.log('Addresses written to frontend/src/contracts/addresses.json and .env');
+  console.log("Next: npm run deploy:tokens && npm run pairs && npm run seed");
 }
 
-main();
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

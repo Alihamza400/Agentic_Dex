@@ -1,32 +1,40 @@
-import mysql from 'mysql2/promise';
-import dotenv from 'dotenv';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import fs from 'fs';
+/**
+ * Creates the MySQL database (if missing) plus every table used by the indexer,
+ * the PHP API and the Python agents. Safe to run repeatedly.
+ *
+ * Usage: node Scripts/db_init.js
+ */
+import mysql from "mysql2/promise";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-dotenv.config({ path: join(__dirname, '../.env') });
+import { readEnv } from "./env.js";
+import { ensureSchema } from "./sync.js";
 
 async function initDB() {
-  const connection = await mysql.createConnection({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-  });
+  const env = readEnv();
+  const host = env.DB_HOST || "127.0.0.1";
+  const user = env.DB_USER || "root";
+  const password = env.DB_PASSWORD || "";
+  const database = env.DB_NAME || "AI_Autonomus_dex";
 
-  const dbName = process.env.DB_NAME || 'AI_Autonomus_dex';
+  console.log(`Connecting to MySQL at ${host} as ${user}...`);
 
-  console.log(`Checking if database "${dbName}" exists...`);
-  
-  await connection.query(`CREATE DATABASE IF NOT EXISTS \`${dbName}\``);
-  console.log(`Database "${dbName}" is ready.`);
+  const root = await mysql.createConnection({ host, user, password, multipleStatements: false });
+  await root.query(`CREATE DATABASE IF NOT EXISTS \`${database}\``);
+  console.log(`Database "${database}" is ready.`);
+  await root.end();
 
-  await connection.end();
+  const conn = await mysql.createConnection({ host, user, password, database });
+  await ensureSchema(conn);
+  const [tables] = await conn.query("SHOW TABLES");
+  await conn.end();
+
+  console.log("Tables ready:");
+  for (const row of tables) console.log(`  - ${Object.values(row)[0]}`);
+  console.log('\nNext: npm run index  (then "npm run api" and "npm run agent")');
 }
 
-initDB().catch(err => {
-  console.error('Error initializing database:', err);
+initDB().catch((err) => {
+  console.error(`Error initializing database: ${err.message}`);
+  console.error("Check DB_HOST / DB_USER / DB_PASSWORD / DB_NAME in .env");
   process.exit(1);
 });

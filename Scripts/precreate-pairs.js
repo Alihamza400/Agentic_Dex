@@ -1,78 +1,49 @@
 import pkg from "hardhat";
 const { ethers } = pkg;
 
+import { readEnv } from "./env.js";
+import { loadTokens } from "./load-tokens.js";
+import { PAIR_PLAN } from "./pairs.js";
+
 async function main() {
-  // Get the deployed factory
-  const addresses = JSON.parse(
-    require("fs").readFileSync("./frontend/src/contracts/addresses.json", "utf8")
-  );
+  const env = readEnv();
+  const factoryAddress = env.Factory_Address;
+  if (!factoryAddress) {
+    throw new Error(".env has no Factory_Address. Run \"npm run deploy\" first.");
+  }
 
-  const factoryAddress = addresses.DexFactory;
-  const Factory = await ethers.getContractFactory("DexFactory");
-  const factory = await Factory.attach(factoryAddress);
+  const tokens = loadTokens();
+  const bySymbol = Object.fromEntries(tokens.map((t) => [t.symbol, t.address]));
+  const factory = await ethers.getContractAt("DexFactory", factoryAddress);
 
-  console.log("Factory address:", factory.target);
+  console.log(`Factory: ${factoryAddress}`);
+  console.log(`Creating ${PAIR_PLAN.length} pairs...\n`);
 
-  // These would be the addresses from the deployed test tokens
-  // We'll use the same addresses as in the test_pair_creation.js script
-  const tokenAddresses = {
-    USDC: "0x5163b86F8B08a75a5EBCBBeCF881cdcb469d388d", // From test_pair_creation.js
-    DAI: "0x4217667a4b59A98971F99EF4828Fc4DCc818a558",  // From test_pair_creation.js
-    // Add more as needed based on deployment
-    WBTC: "0x0000000000000000000000000000000000000000", // Placeholder
-    WETH: "0x0000000000000000000000000000000000000000", // Placeholder
-  };
-
-  console.log("Creating main trading pairs...");
-
-  // Create pairs between major tokens
-  const pairsToCreate = [
-    [tokenAddresses.USDC, tokenAddresses.DAI],
-    // Add more pairs as needed
-  ];
-
-  for (const [tokenA, tokenB] of pairsToCreate) {
-    if (tokenA === "0x0000000000000000000000000000000000000000" ||
-        tokenB === "0x0000000000000000000000000000000000000000") {
-      console.log(`Skipping pair creation for ${tokenA} - ${tokenB} (placeholder addresses)`);
+  const created = [];
+  for (const [symbolA, symbolB] of PAIR_PLAN) {
+    const tokenA = bySymbol[symbolA];
+    const tokenB = bySymbol[symbolB];
+    if (!tokenA || !tokenB) {
+      console.warn(`  SKIP ${symbolA}/${symbolB} - token not deployed`);
       continue;
     }
 
-    try {
-      console.log(`Creating pair for ${tokenA} and ${tokenB}...`);
-
-      // Check if pair already exists
-      const existingPair = await factory.getPair(tokenA, tokenB);
-      if (existingPair !== "0x0000000000000000000000000000000000000000") {
-        console.log(`Pair already exists at: ${existingPair}`);
-        continue;
-      }
-
-      const tx = await factory.createPair(tokenA, tokenB);
-      const receipt = await tx.wait();
-
-      console.log(`Pair created successfully! Transaction: ${tx.hash}`);
-
-      // Find the PairCreated event to get the new pair address
-      const pairCreatedEvent = receipt.logs.find(log => {
-        try {
-          return factory.interface.parseLog(log)?.name === 'PairCreated';
-        } catch {
-          return false;
-        }
-      });
-
-      if (pairCreatedEvent) {
-        const parsedEvent = factory.interface.parseLog(pairCreatedEvent);
-        const pairAddress = parsedEvent.args.pair;
-        console.log(`New pair address: ${pairAddress}`);
-      }
-    } catch (error) {
-      console.error(`Error creating pair for ${tokenA} and ${tokenB}:`, error.message);
+    const existing = await factory.getPair(tokenA, tokenB);
+    if (existing !== ethers.ZeroAddress) {
+      console.log(`  ${symbolA}/${symbolB} already exists at ${existing}`);
+      created.push({ symbolA, symbolB, pair: existing });
+      continue;
     }
+
+    const tx = await factory.createPair(tokenA, tokenB);
+    const receipt = await tx.wait();
+    const pair = await factory.getPair(tokenA, tokenB);
+    created.push({ symbolA, symbolB, pair });
+    console.log(`  ${symbolA}/${symbolB} created at ${pair} (tx ${receipt.hash.slice(0, 12)}...)`);
   }
 
-  console.log("Pre-created pairs process completed.");
+  console.log(`\nPairs ready: ${created.length}. Total pairs on-chain: ${await factory.allPairsLength()}`);
+  console.log("Next: npm run seed");
 }
 
 main().catch((error) => {

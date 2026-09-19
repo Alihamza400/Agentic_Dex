@@ -1,57 +1,45 @@
+import pkg from "hardhat";
+const { ethers } = pkg;
+
+import { saveTokens } from "./update-frontend.js";
+import { writeEnv } from "./env.js";
+
+/** The token list the frontend and the agents trade. */
+export const TEST_TOKENS = [
+  { name: "USD Coin", symbol: "USDC", supply: "100000000" },
+  { name: "Dai Stablecoin", symbol: "DAI", supply: "100000000" },
+  { name: "Wrapped Bitcoin", symbol: "WBTC", supply: "100000000" },
+  { name: "Wrapped Ether", symbol: "WETH", supply: "100000000" },
+  { name: "Chainlink", symbol: "LINK", supply: "100000000" },
+  { name: "Uniswap", symbol: "UNI", supply: "100000000" },
+];
+
 async function main() {
-  const Token = await ethers.getContractFactory("TestToken");
+  const [deployer] = await ethers.getSigners();
+  console.log(`Deploying test tokens as ${deployer.address}`);
 
-  // Deploy popular token equivalents
-  const usdc = await Token.deploy(
-    "USD Coin",
-    "USDC",
-    ethers.parseEther("1000000")
-  );
-  await usdc.waitForDeployment();
-  console.log("USDC:", await usdc.getAddress());
+  const tokens = [];
+  for (const token of TEST_TOKENS) {
+    const contract = await ethers.deployContract("TestToken", [
+      token.name,
+      token.symbol,
+      ethers.parseUnits(token.supply, 18),
+    ]);
+    await contract.waitForDeployment();
+    const address = await contract.getAddress();
+    tokens.push({ ...token, address, decimals: 18 });
+    console.log(`  ${token.symbol.padEnd(5)} ${address}`);
+  }
 
-  const dai = await Token.deploy(
-    "Dai Stablecoin",
-    "DAI",
-    ethers.parseEther("1000000")
-  );
-  await dai.waitForDeployment();
-  console.log("DAI:", await dai.getAddress());
+  saveTokens(tokens);
 
-  const wbtc = await Token.deploy(
-    "Wrapped Bitcoin",
-    "WBTC",
-    ethers.parseEther("1000000")
-  );
-  await wbtc.waitForDeployment();
-  console.log("WBTC:", await wbtc.getAddress());
+  // The agents read these from .env (see Dex_Mcp/src/dex_mcp/Dex_Multi_Agent.py)
+  const envUpdates = {};
+  for (const token of tokens) envUpdates[`${token.symbol}_Address`] = token.address;
+  writeEnv(envUpdates);
 
-  const weth = await Token.deploy(
-    "Wrapped Ether",
-    "WETH",
-    ethers.parseEther("1000000")
-  );
-  await weth.waitForDeployment();
-  console.log("WETH:", await weth.getAddress());
-
-  const link = await Token.deploy(
-    "Chainlink",
-    "LINK",
-    ethers.parseEther("1000000")
-  );
-  await link.waitForDeployment();
-  console.log("LINK:", await link.getAddress());
-
-  const uni = await Token.deploy(
-    "Uniswap",
-    "UNI",
-    ethers.parseEther("1000000")
-  );
-  await uni.waitForDeployment();
-  console.log("UNI:", await uni.getAddress());
-
-  console.log("\nUse these addresses to create pairs in your DEX frontend!");
-  console.log("Remember to copy the addresses above for pair creation.");
+  console.log("\nToken addresses written to frontend/src/constants/deployedTokens.json and .env");
+  console.log("Next: npm run pairs && npm run seed");
 }
 
 main().catch((error) => {
