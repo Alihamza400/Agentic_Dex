@@ -27,7 +27,7 @@ load_dotenv()  # also pick up a local CWD .env if present
 
 RPC_URL = os.getenv("RPC_URL", "http://127.0.0.1:7545")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY") or os.getenv("Private_Key", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 AGENT_INTERVAL_SECONDS = int(os.getenv("AGENT_INTERVAL_SECONDS", "60"))

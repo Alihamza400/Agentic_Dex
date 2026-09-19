@@ -132,19 +132,27 @@ async def read_agent_config() -> dict:
 
 async def collect_market_data() -> dict:
     """Everything the agent needs, gathered from the MCP tool layer."""
+    market = await call_tool("get_market_context", {})
     pools = await call_tool("get_pool_addresses", {})
     balances = await call_tool("get_balances", {})
 
-    # Compact pools: only symbols + spot price + reserves
-    compact_pools = []
+    # Use market context for reserves/price (has live data), pool_addresses for symbols
+    symbol_map = {}
     for p in (pools if isinstance(pools, list) else []):
+        addr = p.get("pair") or p.get("pairAddress", "")
+        symbol_map[addr.lower()] = p
+
+    compact_pools = []
+    for m in (market if isinstance(market, list) else []):
+        addr = m.get("pairAddress") or m.get("pair", "")
+        info = symbol_map.get(addr.lower(), {})
         compact_pools.append({
-            "pair": p.get("pairAddress") or p.get("pair", "?"),
-            "t0": p.get("token0Symbol") or p.get("symbol0", "?"),
-            "t1": p.get("token1Symbol") or p.get("symbol1", "?"),
-            "r0": p.get("reserve0", "0"),
-            "r1": p.get("reserve1", "0"),
-            "price": p.get("spotPrice", "0"),
+            "pair": addr,
+            "t0": info.get("symbol0") or info.get("token0Symbol", "?"),
+            "t1": info.get("symbol1") or info.get("token1Symbol", "?"),
+            "r0": m.get("reserve0", "0"),
+            "r1": m.get("reserve1", "0"),
+            "price": m.get("spotPrice", "0"),
         })
 
     return {
@@ -180,75 +188,13 @@ async def run_llm_cycle(strategy: str, risk: str) -> None:
     tool_calls: list[dict] = []
     rounds = 0
 
-    # Minimal tool set to stay within token budget
-    openai_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_pool_addresses",
-                "description": "List trading pairs.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "execute_trade",
-                "description": "Swap tokens on-chain.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "token_in": {"type": "string"},
-                        "token_out": {"type": "string"},
-                        "amount_in": {"type": "string"},
-                    },
-                    "required": ["token_in", "token_out", "amount_in"],
-                },
-            },
-        },
-    ]
-
-    # Initial LLM call
     response = await asyncio.to_thread(
         lambda: client.chat.completions.create(
             model=OPENROUTER_MODEL,
             messages=messages,
-            tools=openai_tools,
-            tool_choice="auto",
-            max_tokens=150,
+            max_tokens=1024,
         )
     )
-
-    while response.choices and response.choices[0].message.tool_calls and rounds < MAX_TOOL_ROUNDS:
-        rounds += 1
-        assistant_msg = response.choices[0].message
-        messages.append(assistant_msg)
-
-        for tc in assistant_msg.tool_calls:
-            fn_name = tc.function.name
-            try:
-                args = json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
-
-            print(f"  -> tool {fn_name}({json.dumps(args, default=str)[:200]})")
-            result = await call_tool(fn_name, args)
-            tool_calls.append({"tool": fn_name, "args": args, "result": result})
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": json.dumps(result, default=str),
-            })
-
-        response = await asyncio.to_thread(
-            lambda: client.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="auto",
-                max_tokens=150,
-            )
-        )
 
     try:
         summary = response.choices[0].message.content or "(no text response)"
