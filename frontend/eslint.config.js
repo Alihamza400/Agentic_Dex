@@ -12,11 +12,13 @@ export default defineConfig([
   {
     files: ["**/*.{js,jsx}"],
 
-    // Extend recommended ESLint + React + Hooks rules
+    // The plugins expose their flat configs under `configs.flat` /
+    // `recommended-latest`; the legacy `.configs.recommended` entries are eslintrc
+    // style and break flat config.
     extends: [
       js.configs.recommended,
-      react.configs.recommended,             // ⬅ Added
-      reactHooks.configs.flat.recommended,
+      react.configs.flat.recommended,
+      reactHooks.configs["recommended-latest"],
       reactRefresh.configs.vite,
     ],
 
@@ -36,20 +38,28 @@ export default defineConfig([
 
     settings: {
       react: {
-        version: "detect", // ⬅ auto-detect React version
+        version: "detect",
       },
     },
 
     rules: {
-      // Your existing rule
       "no-unused-vars": ["error", { varsIgnorePattern: "^[A-Z_]" }],
+      // Decoding third-party contract logs/events legitimately needs empty catches
+      "no-empty": ["error", { allowEmptyCatch: true }],
 
-      // Recommended React upgrade rules
-      "react/jsx-uses-react": "off", // Not needed for new JSX transform
+      // Not needed with the automatic JSX runtime
+      "react/jsx-uses-react": "off",
       "react/react-in-jsx-scope": "off",
+      "react/no-unescaped-entities": "off",
+      "react/prop-types": "off",
+    },
+  },
 
-      // Improve import safety
-      "no-undef": "error",
+  {
+    // Context modules intentionally export both the context object and the provider
+    files: ["src/context/**/*.jsx"],
+    rules: {
+      "react-refresh/only-export-components": "off",
     },
   },
 ]);

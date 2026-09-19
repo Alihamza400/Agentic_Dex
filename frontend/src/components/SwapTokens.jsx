@@ -13,7 +13,7 @@ export default function SwapTokens() {
   const [tokenOut, setTokenOut] = useState(null);
   const [amountIn, setAmountIn] = useState("");
   const [amountOut, setAmountOut] = useState("");
-  const [slippage, setSlippage] = useState("0.5");
+  const [slippage] = useState("0.5");
   const [loading, setLoading] = useState(false);
   const [approving, setApproving] = useState(false);
   const [balanceIn, setBalanceIn] = useState("0");

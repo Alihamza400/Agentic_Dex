@@ -14,20 +14,15 @@ export default function PairList() {
       if (!factory) return;
       try {
         setLoading(true);
-        const list = [];
-        // try to read sequentially until revert/out-of-bounds
-        for (let i = 0; i < 1000; i++) {
-          try {
-            const p = await factory.allPairs(i);
-            if (!p || p === "0x0000000000000000000000000000000000000000") break;
-            list.push(p);
-          } catch {
-            break;
-          }
-        }
+        // allPairsLength is authoritative - no trial-and-error indexing
+        const length = Number(await factory.allPairsLength());
+        const list = await Promise.all(
+          Array.from({ length }, (_, index) => factory.allPairs(index))
+        );
         setPairs(list);
       } catch (err) {
         console.error("fetchPairs error:", err);
+        setPairs([]);
       } finally {
         setLoading(false);
       }

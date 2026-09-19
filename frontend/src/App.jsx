@@ -13,6 +13,7 @@ import AIAgentControls from './components/AIAgentControls';
 import AIAnalyticsDashboard from './components/AIAnalyticsDashboard';
 import AIRecommendations from './components/AIRecommendations';
 import ConnectWallet from './components/ConnectWallet';
+import TokenFaucet from './components/TokenFaucet';
 import { ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 
@@ -116,6 +117,16 @@ function AppContent() {
                   onClick={() => setSidebarOpen(false)}
                 >
                   AI Recs
+                </Link>
+                <Link
+                  to="/faucet"
+                  className={`${isActive('/faucet')
+                    ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-white shadow-lg border border-cyan-500/30'
+                    : 'text-gray-300 hover:bg-gray-700/50 hover:text-white hover:border-gray-600'}
+                    block px-3 py-3 rounded-lg text-base font-medium transition-all duration-300 border border-transparent`}
+                  onClick={() => setSidebarOpen(false)}
+                >
+                  Faucet
                 </Link>
               </nav>
             </div>
@@ -232,6 +243,18 @@ function AppContent() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
                 AI Recs
+              </Link>
+              <Link
+                to="/faucet"
+                className={`${isActive('/faucet')
+                  ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-white shadow-lg border border-cyan-500/30'
+                  : 'text-gray-300 hover:bg-gray-700/50 hover:text-white hover:border-gray-600'}
+                  group flex items-center px-4 py-3 text-sm font-medium rounded-lg mb-2 transition-all duration-300 border border-transparent`}
+              >
+                <svg className={`mr-3 h-5 w-5 ${isActive('/faucet') ? 'text-green-400' : 'text-gray-400'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Faucet
               </Link>
             </nav>
           </div>
@@ -385,6 +408,7 @@ function AppContent() {
                 <Route path="/ai-agent" element={<AIAgentControls />} />
                 <Route path="/ai-analytics" element={<AIAnalyticsDashboard />} />
                 <Route path="/ai-recommendations" element={<AIRecommendations />} />
+                <Route path="/faucet" element={<TokenFaucet />} />
               </Routes>
             </div>
           </div>

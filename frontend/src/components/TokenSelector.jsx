@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { TOKEN_LIST, searchTokens } from '../constants/tokens';
+import { TOKEN_LIST } from '../constants/tokens';
 
 export default function TokenSelector({
   value,

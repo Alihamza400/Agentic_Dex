@@ -1,11 +1,8 @@
-import React, { useState } from 'react';
-import { Link, useLocation } from 'react-router-dom';
+import React from 'react';
+import { Link } from 'react-router-dom';
 import ConnectWallet from './ConnectWallet';
 
 const Header = ({ sidebarOpen, setSidebarOpen }) => {
-  const location = useLocation();
-  const isActive = (path) => location.pathname === path;
-
   return (
     <nav className="bg-gradient-to-r from-gray-900 via-gray-800 to-gray-900 border-b border-gradient-to-r from-cyan-500/30 via-blue-500/30 to-purple-500/30 shadow-2xl shadow-cyan-500/10 sticky top-0 z-50 backdrop-blur-sm">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">

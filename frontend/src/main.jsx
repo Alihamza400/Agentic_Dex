@@ -2,16 +2,11 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
 import './index.css'
-import { Web3Provider } from './context/Web3Context.jsx'
-import { ToastContainer } from 'react-toastify'
-import 'react-toastify/dist/ReactToastify.css'
 
-
+// App.jsx owns the Web3Provider, the router and the toast container,
+// so nothing must be wrapped twice here.
 ReactDOM.createRoot(document.getElementById('root')).render(
-<React.StrictMode>
-<Web3Provider>
-<App />
-<ToastContainer position="top-right" autoClose={3000} />
-</Web3Provider>
-</React.StrictMode>
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
 )

@@ -7,7 +7,6 @@ import addresses from "../contracts/addresses.json";
 
 export default function RemoveLiquidity() {
   const {
-    factory,
     router,
     account,
     provider,
@@ -19,7 +18,7 @@ export default function RemoveLiquidity() {
   const [loading, setLoading] = useState(false);
   const [lpTokenBalance, setLpTokenBalance] = useState("0");
   const [pairInfo, setPairInfo] = useState(null);
-  const [slippage, setSlippage] = useState("0.5");
+  const [slippage] = useState("0.5");
   const [minAmounts, setMinAmounts] = useState({ amount0: "0", amount1: "0" });
 
   // Get LP token balance when pair is selected
@@ -49,16 +48,7 @@ export default function RemoveLiquidity() {
     fetchLpTokenBalance();
   }, [account, pairAddress, provider, createPairContract, createLPTokenContract]);
 
-  // Calculate expected output and min amounts when LP amount changes
-  useEffect(() => {
-    if (lpTokenAmount && pairInfo && lpTokenBalance !== "0") {
-      const amount = parseFloat(lpTokenAmount);
-      const totalLp = parseFloat(lpTokenBalance); // This is just the user's balance, but we need total supply
-      // Wait, we need the total supply of LP tokens to calculate correctly
-    }
-  }, [lpTokenAmount, pairInfo]);
-
-  // Updated fetchPairInfo to include total supply
+  // Fetch reserves + total LP supply for the selected pair
   useEffect(() => {
     const fetchPairInfo = async () => {
       if (!pairAddress || !provider) return;
@@ -105,7 +95,7 @@ export default function RemoveLiquidity() {
           amount0: (parseFloat(ethers.formatUnits(expected0, 18)) * slip).toFixed(6),
           amount1: (parseFloat(ethers.formatUnits(expected1, 18)) * slip).toFixed(6)
         });
-      } catch (e) {
+      } catch {
         setMinAmounts({ amount0: "0", amount1: "0" });
       }
     } else {

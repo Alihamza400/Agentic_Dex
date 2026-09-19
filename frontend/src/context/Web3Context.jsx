@@ -61,7 +61,7 @@ export function Web3Provider({ children }) {
     } catch (err) {
       console.error("Web3Context: Error in initContracts:", err);
     }
-  }, [FACTORY_ADDRESS, refreshBalance]);
+  }, [FACTORY_ADDRESS, ROUTER_ADDRESS, refreshBalance]);
 
   const connectWallet = useCallback(async () => {
     console.log("Web3Context: Manual connect initiated (Forcing credentials)...");

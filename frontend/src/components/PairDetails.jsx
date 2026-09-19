@@ -32,8 +32,7 @@ export default function PairDetails({ pairAddress }) {
         try {
           const [price0Cum, price1Cum] = await pairContract.getTWAP();
           twapData = { price0Cumulative: price0Cum.toString(), price1Cumulative: price1Cum.toString() };
-        } catch (e) {
-          // TWAP might not be implemented yet
+        } catch {
           twapData = null;
         }
 
