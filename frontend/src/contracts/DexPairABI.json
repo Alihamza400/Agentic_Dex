@@ -310,6 +310,11 @@
         "internalType": "uint256",
         "name": "liquidity",
         "type": "uint256"
+      },
+      {
+        "internalType": "address",
+        "name": "to",
+        "type": "address"
       }
     ],
     "name": "removeLiquidity",

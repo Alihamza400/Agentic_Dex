@@ -8,7 +8,7 @@ This is an Agentic DEX (Decentralized Exchange) project that combines smart cont
 
 - **Smart Contracts**: Core DEX functionality with Factory, Pair, Router, and LP token contracts implementing AMM (x*y=k) mechanics with TWAP oracles
 - **Frontend**: React-based UI using Vite and Tailwind CSS
-- **AI Integration**: Python-based agents using Google Gemini API via MCP for automated trading activities
+- **AI Integration**: Python-based orchestrator agent using Google Gemini API via MCP for automated trading with OODA decision loop
 - **Web3 Integration**: Contract interaction layer using ethers.js
 
 ## Architecture Structure
@@ -31,11 +31,15 @@ This is an Agentic DEX (Decentralized Exchange) project that combines smart cont
 
 ### AI/MCP Integration (`Dex_Mcp/`)
 - Python 3.13+ project using uv for dependency management
-- Multi-agent system with Pool Management, Arbitrage, Liquidity, and Risk agents
-- Google Gemini API integration via OpenAI-compatible endpoint
-- Web3 integration for blockchain data access and state monitoring
-- Model Context Protocol (MCP) server for AI interactions
-- Dependencies managed via `pyproject.toml` with uv
+- Single orchestrator agent (`Dex_Multi_Agent.py`) using Gemini LLM with OODA decision loop
+- MCP Server (`MCP_Server.py`) exposes 15 tools for market data and trade execution
+- Live blockchain reader (`web3.py`) as fallback when MySQL is empty
+- On-chain write functions (`web3_actions.py`) with programmatic risk enforcement:
+  - Trade size caps (configurable by risk level: 5%/10%/20% of wallet)
+  - Slippage guards (0.5%/1%/3% by risk level)
+  - Circuit breaker (stops after 3 consecutive failures)
+- Qdrant vector store (`Vector_Store.py`) for market pattern memory
+- Agent trade tracking with PnL calculation in `agent_trades` table
 
 ## Development Commands
 
@@ -149,6 +153,7 @@ npm test  # (runs the test script in package.json)
 - **Contract Upgradeability**: Proxy patterns with transparent upgrade mechanisms for security patches
 - **Security Audits**: Regular third-party security audits of smart contracts before mainnet deployment
 - **Emergency Pause**: Circuit breaker functionality to pause critical functions during security incidents
+- **Agent Risk Enforcement**: Programmatic trade size caps (5%/10%/20% by risk level), slippage guards (0.5%/1%/3%), and circuit breaker (3 consecutive failures) in `web3_actions.py`
 
 ## Environment Setup
 
@@ -248,6 +253,29 @@ user_balances (
 
     INDEX idx_wallet_address (wallet_address),
     INDEX idx_token_address (token_address)
+)
+```
+
+### Agent Trades Table
+```sql
+agent_trades (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    agentName       VARCHAR(50) NOT NULL,
+    txHash          VARCHAR(66),
+    blockNumber     BIGINT,
+    action          VARCHAR(50) NOT NULL,
+    tokenIn         VARCHAR(42),
+    tokenOut        VARCHAR(42),
+    amountIn        TEXT,
+    amountOut       TEXT,
+    quoteAmount     TEXT,
+    status          VARCHAR(20) DEFAULT 'pending',
+    gasUsed         BIGINT,
+    pnl             DECIMAL(38, 18) DEFAULT NULL,
+    createdAt       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_agent_trades_agent (agentName),
+    INDEX idx_agent_trades_hash (txHash)
 )
 ```
 
