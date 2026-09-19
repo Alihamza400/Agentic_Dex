@@ -1,211 +1,382 @@
 """
-Gigantic Agentic DEX Orchestrator (Professional Quant Version)
-Uses Gemini 2.0 with RAG (Qdrant) and Multi-Hop MCP Tools for professional trading.
-Optimized for high accuracy, arbitrage, and comprehensive position management.
+Agentic DEX orchestrator.
+
+A Gemini-driven "senior quant" agent that reads live blockchain + market data
+through the MCP tool layer and can execute swaps/liquidity operations on-chain.
+
+Unlike the previous version this:
+  * imports everything it uses (it used to crash every cycle with a NameError),
+  * runs a real async tool-calling loop instead of fighting nested event loops,
+  * keeps working when MySQL is down by reading the chain directly,
+  * reads the agent config (strategy/risk/active) written by the frontend.
+
+Usage:
+    uv run dex-agent                 # continuous loop (interval from .env)
+    uv run dex-agent --once          # a single LLM cycle, then exit
+    uv run dex-agent --self-test     # read + print market data, no LLM calls
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
 import json
 import os
+import sys
 import time
-import google.generativeai as genai
-import nest_asyncio
+
+import aiomysql
 from dotenv import load_dotenv
 
-# Import MCP tools and Vector Store
+from dex_mcp.config import (
+    AGENT_INTERVAL_SECONDS,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
+    describe,
+    load_tokens,
+)
 from dex_mcp.MCP_Server import (
-    _get_market_context,
-    _get_recent_swaps,
-    _get_price_trend,
+    DatabaseUnavailable,
+    _execute_arbitrage,
+    _execute_trade,
+    _get_balances,
     _get_liquidity_stats,
+    _get_live_pool_state,
+    _get_market_context,
+    _get_pools_for_agent,
+    _get_price_trend,
+    _get_recent_swaps,
     _get_risk_metrics,
+    _get_tokens,
+    _manage_liquidity,
     _record_agent_decision,
     _search_market_history,
-    _execute_trade,
-    _manage_liquidity,
-    _get_balances,
-    _execute_arbitrage
+    close_pool,
+    get_pool,
 )
 
 load_dotenv()
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Apply nest_asyncio to allow nested event loops (fix for Gemini tool calling)
-nest_asyncio.apply()
+MAX_TOOL_ROUNDS = 2
 
-# ── Sync Tool Wrappers (Gemini SDK compatibility) ────────────────────────────
+SYSTEM_INSTRUCTION = """Senior Quant Orchestrator. OODA loop: Observe→Orient→Decide→Act.
+Tools: get_pool_addresses, get_market_context, get_balances, execute_trade, execute_arbitrage.
+Rules: max 10% wallet per trade, 1% slippage, only trade on clear positive edge after 0.3% fee.
+Reply with: DECISION (HOLD/TRADE/ARB), amounts in wei, reasoning."""
 
-def run_sync(coro):
-    """Helper to run coroutines from synchronous tool calls."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(coro)
+# ── Tool registry (name -> async callable) ────────────────────────────────────
+TOOLS = {
+    "get_market_context": _get_market_context,
+    "get_pool_addresses": _get_pools_for_agent,
+    "get_deployed_tokens": _get_tokens,
+    "get_live_pool_state": _get_live_pool_state,
+    "get_balances": _get_balances,
+    "get_recent_swaps": _get_recent_swaps,
+    "get_price_trend": _get_price_trend,
+    "get_liquidity_stats": _get_liquidity_stats,
+    "get_risk_metrics": _get_risk_metrics,
+    "search_market_history": _search_market_history,
+    "execute_trade": _execute_trade,
+    "execute_arbitrage": _execute_arbitrage,
+    "manage_liquidity": _manage_liquidity,
+}
 
-def get_market_context():
-    """Returns the latest reserves, spot price, and TWAP for every pair."""
-    return run_sync(_get_market_context())
+async def call_tool(name: str, args: dict) -> dict | list:
+    """Invoke one MCP tool by name, never raising into the agent loop."""
+    tool = TOOLS.get(name)
+    if tool is None:
+        return {"error": f"Unknown tool: {name}"}
+    try:
+        result = await tool(**args)
+        return result if result is not None else {"result": "ok"}
+    except TypeError as exc:
+        return {"error": f"Bad arguments for {name}: {exc}"}
+    except DatabaseUnavailable as exc:
+        return {"error": f"Database unavailable: {exc}"}
+    except Exception as exc:  # noqa: BLE001 - tool failures must not kill the loop
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
-def get_balances(token_addresses: list[str]):
-    """Returns the agent's current token balances."""
-    return run_sync(_get_balances(token_addresses))
 
-def execute_arbitrage(path: list[str], amount_in: str):
-    """Execute a multi-hop swap for arbitrage capturing."""
-    return run_sync(_execute_arbitrage(path, amount_in))
-
-def search_market_history(query: str, limit: int = 5):
-    """Search historical market patterns using vector similarity in Qdrant."""
-    return run_sync(_search_market_history(query, limit))
-
-def execute_trade(token_in: str, token_out: str, amount_in: str):
-    """Execute a token swap on the DEX blockchain. amount_in is in Wei."""
-    return run_sync(_execute_trade(token_in, token_out, amount_in))
-
-def manage_liquidity(action: str, token_a: str, token_b: str, amount_a: str = "0", amount_b: str = "0", liquidity: str = "0"):
-    """Add or remove liquidity from a trading pair on the blockchain."""
-    return run_sync(_manage_liquidity(action, token_a, token_b, amount_a, amount_b, liquidity))
-
-def get_recent_swaps(n: int = 20):
-    """Returns the last N swap events with amounts and pair addresses."""
-    return run_sync(_get_recent_swaps(n))
-
-def get_risk_metrics(pair_address: str):
-    """Returns price volatility (std dev, min, max, avg) for a pair over last 100 blocks."""
-    return run_sync(_get_risk_metrics(pair_address))
-
-def get_price_trend(pair_address: str, n: int = 50):
-    """Returns historical price snapshots for one pair."""
-    return run_sync(_get_price_trend(pair_address, n))
-
-# ── Agent Setup ──────────────────────────────────────────────────────────────
-
-tools = [
-    get_market_context,
-    get_balances,
-    execute_arbitrage,
-    search_market_history,
-    execute_trade,
-    manage_liquidity,
-    get_recent_swaps,
-    get_risk_metrics,
-    get_price_trend
-]
-
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash",
-    tools=tools,
-    system_instruction=(
-        "You are the 'Senior Quant Orchestrator' of a sophisticated DEX trading system.\n\n"
-        "CORE MANDATE:\n"
-        "Execute high-fidelity trading strategies including Arbitrage, Trend Following, and Liquidity Mining. "
-        "Maintain total capital preservation while extracting maximum value from the market.\n\n"
-        "DECISION FRAMEWORK (OODA Loop):\n"
-        "1. OBSERVE: Fetch your wallet balances and the global market context.\n"
-        "2. ORIENT: Identify price discrepancies between spot and TWAP. If a trend is forming, search historical RAG memory (Qdrant) to see how it played out before.\n"
-        "3. DECIDE: Calculate the 'Expected Value' (EV) of a trade. \n"
-        "   - ARBITRAGE: If path A->B->C->A yields >0.3% (after 0.3% fee per hop), it is a priority.\n"
-        "   - TREND: If spot price deviates significantly from historical vector norms, prepare to trade.\n"
-        "   - LIQUIDITY: If a pool is underweight and volatility is low, add liquidity for fee revenue.\n"
-        "4. ACT: Execute the tool call with precision. Report the resulting tx_hash.\n\n"
-        "RISK PARAMETERS:\n"
-        "- Max position size: 10% of total balance per trade.\n"
-        "- Slippage limit: 1%.\n"
-        "- Never trade during high-volatility spikes (check risk_metrics).\n\n"
-        "REPORTING:\n"
-        "Produce a 'Gorgeous' analytical summary. Use bullet points and clear technical reasoning."
-    )
-)
-
-AGENT_INTERVAL_SECONDS = 60 
-
-async def process_agent_loop():
-    print(f"\n{'='*20} QUANT CYCLE START {'='*20}")
-    
-    # Step 0: Read Configuration from DB (Frontend Control)
+async def read_agent_config() -> dict:
+    """Strategy/risk/active flags set from the frontend; sensible defaults if the DB is down."""
+    default = {"strategy": "arbitrage", "risk_level": "medium", "is_active": 1}
     try:
         pool = await get_pool()
         async with pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute("SELECT * FROM agent_config WHERE id = 1")
-                config = await cur.fetchone()
-        
-        if not config or not config['is_active']:
-            print(f"[{time.strftime('%H:%M:%S')}] Agent is INACTIVE in DB. Skipping cycle...")
-            return
-            
-        print(f"[{time.strftime('%H:%M:%S')}] Agent ACTIVE. Strategy: {config['strategy']}, Risk: {config['risk_level']}")
-        current_strategy = config['strategy']
-        current_risk = config['risk_level']
-    except Exception as e:
-        print(f"Error reading agent_config: {e}")
-        return
+                row = await cur.fetchone()
+        if not row:
+            return default
+        return {**default, **{k: v for k, v in row.items() if v is not None}}
+    except Exception as exc:
+        print(f"[warn] agent_config unavailable ({exc}); using defaults", file=sys.stderr)
+        return default
 
-    print(f"[{time.strftime('%H:%M:%S')}] Orchestrator gathering data manually...")
 
-    try:
-        # Step 1: Pre-fetch data to save API calls
-        context = await _get_market_context()
-        usdc_addr = "0x2483fCcf791BE94436601dFB8B1761db57bA111D"
-        dai_addr = "0x359315adBE8B38C37eD95a9635a780673e1F81cA"
-        balances = await asyncio.to_thread(get_balances, [usdc_addr, dai_addr])
+async def collect_market_data() -> dict:
+    """Everything the agent needs, gathered from the MCP tool layer."""
+    pools = await call_tool("get_pool_addresses", {})
+    balances = await call_tool("get_balances", {})
 
-        market_data_summary = json.dumps({
-            "market_context": context,
-            "wallet_balances": balances,
-            "tokens": {"USDC": usdc_addr, "DAI": dai_addr},
-            "user_commanded_strategy": current_strategy,
-            "user_commanded_risk_level": current_risk
-        }, indent=2)
+    # Compact pools: only symbols + spot price + reserves
+    compact_pools = []
+    for p in (pools if isinstance(pools, list) else []):
+        compact_pools.append({
+            "pair": p.get("pairAddress", "?"),
+            "t0": p.get("token0Symbol", "?"),
+            "t1": p.get("token1Symbol", "?"),
+            "r0": p.get("reserve0", "0"),
+            "r1": p.get("reserve1", "0"),
+            "price": p.get("spotPrice", "0"),
+        })
 
-        print(f"[{time.strftime('%H:%M:%S')}] Data gathered. Consulting Gemini...")
-        
-        chat = model.start_chat(enable_automatic_function_calling=True)
+    return {
+        "pools": compact_pools,
+        "wallet_balances": balances,
+    }
 
-        prompt = (
-            f"CURRENT MARKET STATE:\n{market_data_summary}\n\n"
-            f"REQUIRED STRATEGY: {current_strategy}\n"
-            f"RISK TOLERANCE: {current_risk}\n\n"
-            "TASK:\n"
-            f"1. You MUST follow the {current_strategy} strategy as priority.\n"
-            f"2. Adjust your position sizes according to {current_risk} risk.\n"
-            "3. Analyze pool health and spot vs TWAP deviation.\n"
-            "4. EXECUTE actions using your tools if the strategy yields opportunity.\n"
-            "5. Report the result."
+
+async def run_llm_cycle(strategy: str, risk: str) -> None:
+    """One full LLM-driven decision cycle using OpenAI-compatible API (OpenRouter)."""
+    import httpx
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        http_client=httpx.Client(verify=False),
+    )
+
+    data = await collect_market_data()
+    prompt = (
+        f"{json.dumps(data, default=str)}\n"
+        f"Strategy={strategy} Risk={risk}\n"
+        "If arbitrage exists, execute it. Otherwise HOLD."
+    )
+
+    messages = [
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": prompt},
+    ]
+
+    tool_calls: list[dict] = []
+    rounds = 0
+
+    # Minimal tool set to stay within token budget
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_pool_addresses",
+                "description": "List all trading pairs with token symbols and addresses.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_market_context",
+                "description": "Latest reserves, spot price for every pair.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_balances",
+                "description": "Wallet token balances (human-readable).",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_trade",
+                "description": "Swap token_in for token_out on-chain. Amounts in wei.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "token_in": {"type": "string"},
+                        "token_out": {"type": "string"},
+                        "amount_in": {"type": "string"},
+                    },
+                    "required": ["token_in", "token_out", "amount_in"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_arbitrage",
+                "description": "Multi-hop swap path. Amounts in wei.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "array", "items": {"type": "string"}},
+                        "amount_in": {"type": "string"},
+                        "min_amount_out": {"type": "string"},
+                    },
+                    "required": ["path", "amount_in"],
+                },
+            },
+        },
+    ]
+
+    # Initial LLM call
+    response = await asyncio.to_thread(
+        lambda: client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+            max_tokens=400,
+        )
+    )
+
+    while response.choices and response.choices[0].message.tool_calls and rounds < MAX_TOOL_ROUNDS:
+        rounds += 1
+        assistant_msg = response.choices[0].message
+        messages.append(assistant_msg)
+
+        for tc in assistant_msg.tool_calls:
+            fn_name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+
+            print(f"  -> tool {fn_name}({json.dumps(args, default=str)[:200]})")
+            result = await call_tool(fn_name, args)
+            tool_calls.append({"tool": fn_name, "args": args, "result": result})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, default=str),
+            })
+
+        response = await asyncio.to_thread(
+            lambda: client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=messages,
+                tools=openai_tools,
+                tool_choice="auto",
+                max_tokens=400,
+            )
         )
 
-        # This will now likely take only 1-2 calls total
-        response = await asyncio.to_thread(chat.send_message, prompt)
+    try:
+        summary = response.choices[0].message.content or "(no text response)"
+    except Exception:
+        summary = "(the model returned no text - see toolCalls context)"
 
-        print("\n[Senior Quant Log]")
-        print(response.text)
-        ...
-        await _record_agent_decision(
-            agent="Quant_Orchestrator",
-            action="QUANT_ANALYSIS",
-            reason=response.text[:1000],
-            confidence=1.0,
-            context={"full_log": response.text}
-        )
-        
-    except Exception as e:
-        print(f"!!! Loop Error: {e}")
+    print("\n[Senior Quant Log]\n" + summary)
 
-async def main():
-    print("="*60)
-    print("  GIGANTIC AGENTIC DEX ORCHESTRATOR v3.0 (Quant Grade)  ")
-    print("  Initializing AI brain with RAG & Web3 Execution Tools... ")
-    print("="*60)
-    
-    if not os.getenv("GEMINI_API_KEY"):
-        print("CRITICAL: GEMINI_API_KEY missing.")
+    await _record_agent_decision(
+        agent="Quant_Orchestrator",
+        action="QUANT_ANALYSIS",
+        reason=summary[:4000],
+        confidence=1.0,
+        context={"strategy": strategy, "risk": risk, "toolCalls": tool_calls},
+    )
+
+
+async def process_agent_loop() -> None:
+    config = await read_agent_config()
+    if not config.get("is_active"):
+        print(f"[{time.strftime('%H:%M:%S')}] Agent INACTIVE in agent_config. Skipping cycle.")
+        return
+
+    strategy = config.get("strategy", "arbitrage")
+    risk = config.get("risk_level", "medium")
+    print(f"[{time.strftime('%H:%M:%S')}] Agent ACTIVE - strategy={strategy} risk={risk}")
+
+    if not OPENROUTER_API_KEY:
+        print("CRITICAL: OPENROUTER_API_KEY is not set, cannot run the LLM cycle.")
         return
 
     try:
-        while True:
-            await process_agent_loop()
-            print(f"\n[Cycle Pause] Next sweep in {AGENT_INTERVAL_SECONDS}s...")
-            await asyncio.sleep(AGENT_INTERVAL_SECONDS)
+        await run_llm_cycle(strategy, risk)
+    except Exception as exc:  # noqa: BLE001 - one bad cycle must not kill the agent
+        print(f"!!! Cycle error: {type(exc).__name__}: {exc}")
+
+
+async def self_test() -> int:
+    """Exercises the read path the agent depends on - no LLM, no writes."""
+    print("=" * 60)
+    print("  AGENT SELF-TEST (blockchain data path)")
+    print("=" * 60)
+    print(describe() + "\n")
+
+    config = await read_agent_config()
+    print(f"agent_config: {config}\n")
+
+    data = await collect_market_data()
+    pools = data["pools"]
+    market = data["market_context"]
+
+    print(f"pools discovered      : {len(pools) if isinstance(pools, list) else 'error'}")
+    for pool in pools if isinstance(pools, list) else []:
+        print(f"  {pool.get('symbol0')}/{pool.get('symbol1')} {pool.get('pair')}")
+
+    print(f"market snapshots      : {len(market) if isinstance(market, list) else 'error'}")
+    if isinstance(market, list) and market:
+        print(f"  sample: {json.dumps(market[0], default=str)[:300]}")
+
+    print(f"deployed tokens       : {len(data['tokens']) if isinstance(data['tokens'], dict) else 'error'}")
+    print(f"wallet balances       : {json.dumps(data['wallet_balances'], default=str)}")
+
+    if isinstance(pools, list) and pools:
+        pair = pools[0].get("pair")
+        state = await call_tool("get_live_pool_state", {"pair_address": pair})
+        print(f"live pool state       : {json.dumps(state, default=str)[:300]}")
+        swaps = await call_tool("get_recent_swaps", {"n": 5})
+        print(f"recent swaps          : {len(swaps) if isinstance(swaps, list) else 'error'}")
+        risk = await call_tool("get_risk_metrics", {"pair_address": pair})
+        print(f"risk metrics          : {json.dumps(risk, default=str)[:200]}")
+
+    ok = isinstance(pools, list) and len(pools) > 0 and isinstance(data["tokens"], dict) and data["tokens"]
+    print("\nRESULT:", "PASS - the agent can read live blockchain data" if ok else "FAIL - no pools/tokens found")
+    return 0 if ok else 1
+
+
+async def main_async(once: bool, self_test_mode: bool) -> int:
+    if self_test_mode:
+        return await self_test()
+
+    print("=" * 60)
+    print("  AGENTIC DEX ORCHESTRATOR")
+    print("=" * 60)
+
+    if once:
+        await process_agent_loop()
+        await close_pool()
+        return 0
+
+    while True:
+        await process_agent_loop()
+        print(f"\n[Cycle pause] next sweep in {AGENT_INTERVAL_SECONDS}s...")
+        await asyncio.sleep(AGENT_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Agentic DEX AI orchestrator")
+    parser.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    parser.add_argument("--self-test", action="store_true", help="read + print market data, no LLM")
+    parser.add_argument("--interval", type=int, default=None, help="override the cycle interval")
+    args = parser.parse_args()
+
+    if args.interval:
+        os.environ["AGENT_INTERVAL_SECONDS"] = str(args.interval)
+
+    try:
+        code = asyncio.run(main_async(args.once, args.self_test))
     except KeyboardInterrupt:
         print("\nGraceful shutdown.")
+        code = 0
+    raise SystemExit(code)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

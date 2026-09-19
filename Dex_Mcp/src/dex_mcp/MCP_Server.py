@@ -1,234 +1,492 @@
 """
-MCP Server for Agentic DEX
-Exposes tools for AI agents to query real blockchain data from MySQL and Qdrant,
-and execute actions on the blockchain.
+MCP Server for the Agentic DEX.
+
+Exposes tools the AI agents use to (a) read market/blockchain state and
+(b) execute real transactions. MySQL (written by Scripts/sync.js) is the fast
+path; when the DB is empty or unreachable every read tool falls back to live
+chain reads so the agents never operate blind.
 """
 
+from __future__ import annotations
+
 import asyncio
+import inspect
 import json
-import os
+import sys
 import time
+from decimal import Decimal
 from functools import wraps
 from typing import Any
 
 import aiomysql
-from decimal import Decimal
 from dotenv import load_dotenv
+from mcp import types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp import types
 
+from dex_mcp.config import DB_CONFIG, describe
+from dex_mcp import web3 as chain
 from dex_mcp.Vector_Store import vector_store
 from dex_mcp.web3_actions import (
-    swap_tokens, add_liquidity, remove_liquidity, 
-    approve_token, get_balances, execute_multi_hop_swap
+    add_liquidity,
+    approve_token,
+    execute_multi_hop_swap,
+    get_balances,
+    get_deployed_tokens,
+    remove_liquidity,
+    swap_tokens,
 )
 
 load_dotenv()
 
+
 def convert_decimals(obj):
     if isinstance(obj, list):
         return [convert_decimals(i) for i in obj]
-    elif isinstance(obj, dict):
+    if isinstance(obj, dict):
         return {k: convert_decimals(v) for k, v in obj.items()}
-    elif isinstance(obj, Decimal):
+    if isinstance(obj, Decimal):
         return str(obj)
     return obj
 
-# ── Database Config ───────────────────────────────────────────────────────────
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
-    "user":     os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "db":       os.getenv("DB_NAME"),
-    "autocommit": True,
-}
 
-# ── In-memory Cache (NFR: Speed) ──────────────────────────────────────────────
+# ── In-memory cache (keeps the LLM from spamming the DB) ──────────────────────
 _cache: dict[str, tuple[float, Any]] = {}
 CACHE_TTL = 5  # seconds
 
 
-def cached(key_fn):
-    """Decorator that caches async function results for CACHE_TTL seconds."""
+def cached(key_fn, ttl: float = CACHE_TTL):
+    """
+    Cache an async tool result for `ttl` seconds (ttl <= 0 disables caching).
+
+    `key_fn` receives a dict of the bound call arguments, so both positional and
+    keyword invocations (the MCP layer always uses keywords) produce one key.
+    Tools whose result changes as a consequence of the agent's own actions
+    (recent swaps, live reserves, balances) are deliberately uncached.
+    """
+
     def decorator(fn):
+        if ttl <= 0:
+            return fn
+
+        signature = inspect.signature(fn)
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
-            key = key_fn(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            key = key_fn(bound.arguments)
             now = time.monotonic()
             if key in _cache:
                 ts, val = _cache[key]
-                if now - ts < CACHE_TTL:
+                if now - ts < ttl:
                     return val
             result = await fn(*args, **kwargs)
             _cache[key] = (now, result)
             return result
+
         return wrapper
+
     return decorator
 
 
-# ── Database Pool ─────────────────────────────────────────────────────────────
+# ── Database ──────────────────────────────────────────────────────────────────
 _pool: aiomysql.Pool | None = None
+
+
+class DatabaseUnavailable(RuntimeError):
+    """Raised when MySQL cannot be reached; read tools fall back to the chain."""
 
 
 async def get_pool() -> aiomysql.Pool:
     global _pool
     if _pool is None:
-        _pool = await aiomysql.create_pool(**DB_CONFIG, minsize=2, maxsize=5)
+        _pool = await aiomysql.create_pool(**DB_CONFIG, minsize=1, maxsize=5)
     return _pool
 
 
+async def close_pool() -> None:
+    """Release MySQL connections so short-lived processes can exit cleanly."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        await _pool.wait_closed()
+        _pool = None
+
+
 async def query(sql: str, args=()) -> list[dict]:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(sql, args)
-            rows = await cur.fetchall()
-            return convert_decimals([dict(r) for r in rows])
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, args)
+                rows = await cur.fetchall()
+                return convert_decimals([dict(r) for r in rows])
+    except Exception as exc:
+        raise DatabaseUnavailable(str(exc)) from exc
 
 
 async def execute(sql: str, args=()) -> int:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, args)
-            return cur.rowcount
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, args)
+                return cur.rowcount
+    except Exception as exc:
+        raise DatabaseUnavailable(str(exc)) from exc
 
 
-# ── MCP Tools (Read) ─────────────────────────────────────────────────────────
+async def try_db(coro, fallback):
+    """Await a DB read; on any DB problem, use the live-chain fallback."""
+    try:
+        result = await coro
+        if result:
+            return result
+    except DatabaseUnavailable:
+        pass
+    return await fallback()
 
-@cached(lambda n=10: f"market_context")
+
+# ── Read tools ────────────────────────────────────────────────────────────────
+
+@cached(lambda a: "market_context")
 async def _get_market_context() -> list[dict]:
-    """Latest snapshot per pair – used by all agents as baseline context."""
-    rows = await query("""
-        SELECT ps.*
-        FROM pair_snapshots ps
-        INNER JOIN (
-            SELECT pairAddress, MAX(blockNumber) AS maxBlock
-            FROM pair_snapshots
-            GROUP BY pairAddress
-        ) latest ON ps.pairAddress = latest.pairAddress AND ps.blockNumber = latest.maxBlock
-        ORDER BY ps.blockNumber DESC
-    """)
-    return [dict(r) for r in rows]
+    """Latest snapshot per pair (DB), falling back to live reserves."""
+
+    async def live():
+        return await asyncio.to_thread(chain.get_all_pool_states)
+
+    rows = await try_db(
+        query(
+            """
+            SELECT ps.*
+            FROM pair_snapshots ps
+            INNER JOIN (
+                SELECT pairAddress, MAX(blockNumber) AS maxBlock
+                FROM pair_snapshots
+                GROUP BY pairAddress
+            ) latest ON ps.pairAddress = latest.pairAddress AND ps.blockNumber = latest.maxBlock
+            ORDER BY ps.blockNumber DESC
+            """
+        ),
+        live,
+    )
+    return [{**row, "dataSource": "db"} if "reserve0" in row else row for row in rows]
 
 
-@cached(lambda n=20: f"recent_swaps_{n}")
+@cached(lambda a: "pool_addresses")
+async def _get_pools_for_agent() -> list[dict]:
+    """Every pair with its two token symbols - the agent's map of the market.
+    Reads from DB first (pair_snapshots + dex_events for token info), falls back to live chain."""
+
+    async def live():
+        pools = []
+        for pair in chain.get_all_pairs():
+            token0, token1 = chain.get_pair_tokens(pair)
+            pools.append(
+                {
+                    "pair": pair,
+                    "token0": token0,
+                    "token1": token1,
+                    "symbol0": chain.token_symbol(token0),
+                    "symbol1": chain.token_symbol(token1),
+                }
+            )
+        return pools
+
+    async def from_db():
+        rows = await query(
+            """
+            SELECT DISTINCT
+                ps.pairAddress AS pair,
+                JSON_UNQUOTE(JSON_EXTRACT(de.data, '$.token0')) AS token0,
+                JSON_UNQUOTE(JSON_EXTRACT(de.data, '$.token1')) AS token1
+            FROM pair_snapshots ps
+            LEFT JOIN dex_events de ON de.contractAddress = ps.pairAddress
+                AND de.eventName = 'Sync'
+            WHERE ps.pairAddress IS NOT NULL
+            ORDER BY ps.blockNumber DESC
+            """
+        )
+        if not rows:
+            return await live()
+
+        # Enrich with token symbols from chain (fast lookup, cached)
+        pools = []
+        seen = set()
+        for row in rows:
+            pair = row.get("pair", "")
+            if not pair or pair in seen:
+                continue
+            seen.add(pair)
+            token0 = row.get("token0") or ""
+            token1 = row.get("token1") or ""
+            # If DB didn't have token addresses, read from chain
+            if not token0 or not token1:
+                t0, t1 = chain.get_pair_tokens(pair)
+                token0, token1 = t0, t1
+            pools.append(
+                {
+                    "pair": pair,
+                    "token0": token0,
+                    "token1": token1,
+                    "symbol0": chain.token_symbol(token0) if token0 else "?",
+                    "symbol1": chain.token_symbol(token1) if token1 else "?",
+                    "source": "db",
+                }
+            )
+        return pools
+
+    return await try_db(from_db(), live)
+
+
+@cached(lambda a: f"live_state_{a['pair_address']}", ttl=0)
+async def _get_live_pool_state(pair_address: str) -> dict:
+    """Live reserves/spot/TWAP read straight from the DexPair contract."""
+    return await asyncio.to_thread(chain.get_pool_state, pair_address)
+
+
+@cached(lambda a: f"recent_swaps_{a['n']}", ttl=0)
 async def _get_recent_swaps(n: int = 20) -> list[dict]:
-    """Last N swap events."""
-    rows = await query("""
-        SELECT blockNumber, transactionHash, contractAddress, data, createdAt
-        FROM dex_events
-        WHERE eventName = 'Swap'
-        ORDER BY blockNumber DESC
-        LIMIT %s
-    """, (n,))
-    return [dict(r) for r in rows]
+    """Last N swap events (DB first, live logs as fallback)."""
+
+    async def live():
+        return await asyncio.to_thread(chain.get_recent_swaps, n)
+
+    rows = await try_db(
+        query(
+            """
+            SELECT blockNumber, transactionHash, contractAddress, data, createdAt
+            FROM dex_events
+            WHERE eventName = 'Swap'
+            ORDER BY blockNumber DESC, id DESC
+            LIMIT %s
+            """,
+            (n,),
+        ),
+        live,
+    )
+    return rows if rows else await live()
 
 
-@cached(lambda pair, n=50: f"price_trend_{pair}_{n}")
+@cached(lambda a: f"price_trend_{a['pair_address']}_{a['n']}")
 async def _get_price_trend(pair_address: str, n: int = 50) -> list[dict]:
-    """Historical price snapshots for one pair over last N blocks."""
-    rows = await query("""
-        SELECT blockNumber, blockTimestamp, reserve0, reserve1, spotPrice,
-               price0Cumulative, price1Cumulative
-        FROM pair_snapshots
-        WHERE pairAddress = %s
-        ORDER BY blockNumber DESC
-        LIMIT %s
-    """, (pair_address, n))
-    return [dict(r) for r in rows]
+    """Historical snapshots for one pair; a single live point if the DB is empty."""
 
+    async def live():
+        state = await asyncio.to_thread(chain.get_pool_state, pair_address)
+        return [state] if "reserve0" in state else []
 
-@cached(lambda: "liquidity_stats")
-async def _get_liquidity_stats() -> list[dict]:
-    """Aggregate Mint and Burn events per pair."""
-    rows = await query("""
-        SELECT
-            contractAddress AS pairAddress,
-            SUM(CASE WHEN eventName='Mint' THEN JSON_EXTRACT(data,'$.liquidity') ELSE 0 END) AS totalMinted,
-            SUM(CASE WHEN eventName='Burn' THEN JSON_EXTRACT(data,'$.liquidity') ELSE 0 END) AS totalBurned,
-            COUNT(CASE WHEN eventName='Mint' THEN 1 END) AS mintCount,
-            COUNT(CASE WHEN eventName='Burn' THEN 1 END) AS burnCount
-        FROM dex_events
-        WHERE eventName IN ('Mint','Burn')
-        GROUP BY contractAddress
-    """)
-    return [dict(r) for r in rows]
-
-
-@cached(lambda pair: f"risk_{pair}")
-async def _get_risk_metrics(pair_address: str) -> dict:
-    """Volatility metrics: price std dev and min/max over last 100 snapshots."""
-    rows = await query("""
-        SELECT
-            STDDEV(CAST(spotPrice AS DECIMAL(40,0))) AS priceStdDev,
-            MIN(CAST(spotPrice AS DECIMAL(40,0)))     AS priceMin,
-            MAX(CAST(spotPrice AS DECIMAL(40,0)))     AS priceMax,
-            AVG(CAST(spotPrice AS DECIMAL(40,0)))     AS priceAvg,
-            COUNT(*)                                  AS sampleCount
-        FROM (
-            SELECT spotPrice FROM pair_snapshots
+    return await try_db(
+        query(
+            """
+            SELECT blockNumber, blockTimestamp, reserve0, reserve1, spotPrice,
+                   price0Cumulative, price1Cumulative
+            FROM pair_snapshots
             WHERE pairAddress = %s
-            ORDER BY blockNumber DESC LIMIT 100
-        ) recent
-    """, (pair_address,))
-    return dict(rows[0]) if rows else {}
+            ORDER BY blockNumber DESC
+            LIMIT %s
+            """,
+            (pair_address, n),
+        ),
+        live,
+    )
 
 
-async def _record_agent_decision(agent: str, action: str, reason: str, confidence: float, context: dict) -> str:
-    await execute("""
-        INSERT INTO agent_decisions (agentName, action, reason, confidence, contextJSON)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (agent, action, reason, confidence, json.dumps(context, default=str)))
-    return "Decision recorded."
+@cached(lambda a: "liquidity_stats")
+async def _get_liquidity_stats() -> list[dict]:
+    """Aggregated Mint/Burn per pair; live reserves when the DB has no events."""
+
+    async def live():
+        pools = await asyncio.to_thread(chain.get_all_pool_states)
+        return [
+            {
+                "pairAddress": p.get("pair"),
+                "reserve0": p.get("reserve0"),
+                "reserve1": p.get("reserve1"),
+                "token0Symbol": p.get("token0Symbol"),
+                "token1Symbol": p.get("token1Symbol"),
+                "source": "chain",
+            }
+            for p in pools
+            if "reserve0" in p
+        ]
+
+    return await try_db(
+        query(
+            """
+            SELECT
+                contractAddress AS pairAddress,
+                SUM(CASE WHEN eventName='Mint' THEN JSON_EXTRACT(data,'$.liquidity') ELSE 0 END) AS totalMinted,
+                SUM(CASE WHEN eventName='Burn' THEN JSON_EXTRACT(data,'$.liquidity') ELSE 0 END) AS totalBurned,
+                COUNT(CASE WHEN eventName='Mint' THEN 1 END) AS mintCount,
+                COUNT(CASE WHEN eventName='Burn' THEN 1 END) AS burnCount
+            FROM dex_events
+            WHERE eventName IN ('Mint','Burn')
+            GROUP BY contractAddress
+            """
+        ),
+        live,
+    )
+
+
+@cached(lambda a: f"risk_{a['pair_address']}")
+async def _get_risk_metrics(pair_address: str) -> dict:
+    """Price volatility over recent snapshots; spot/TWAP only when from chain."""
+
+    async def live():
+        state = await asyncio.to_thread(chain.get_pool_state, pair_address)
+        if "reserve0" not in state:
+            return {"error": state.get("error", "pair unavailable"), "source": "chain"}
+        return {
+            "pairAddress": pair_address,
+            "spotPrice": state["spotPrice"],
+            "reserve0": state["reserve0"],
+            "reserve1": state["reserve1"],
+            "sampleCount": 1,
+            "note": "Historical volatility needs the indexer (npm run index) to be running.",
+            "source": "chain",
+        }
+
+    rows = await try_db(
+        query(
+            """
+            SELECT
+                STDDEV(CAST(spotPrice AS DECIMAL(40,0))) AS priceStdDev,
+                MIN(CAST(spotPrice AS DECIMAL(40,0)))     AS priceMin,
+                MAX(CAST(spotPrice AS DECIMAL(40,0)))     AS priceMax,
+                AVG(CAST(spotPrice AS DECIMAL(40,0)))     AS priceAvg,
+                COUNT(*)                                  AS sampleCount
+            FROM (
+                SELECT spotPrice FROM pair_snapshots
+                WHERE pairAddress = %s
+                ORDER BY blockNumber DESC LIMIT 100
+            ) recent
+            """,
+            (pair_address,),
+        ),
+        live,
+    )
+    if isinstance(rows, dict):
+        return rows
+    return rows[0] if rows else await live()
+
+
+async def _record_agent_decision(
+    agent: str, action: str, reason: str, confidence: float, context: dict
+) -> str:
+    """Persist a decision for auditability. Never fails the agent loop."""
+    try:
+        await execute(
+            """
+            INSERT INTO agent_decisions (agentName, action, reason, confidence, contextJSON)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (agent, action, reason, confidence, json.dumps(context, default=str)),
+        )
+        return "Decision recorded."
+    except DatabaseUnavailable as exc:
+        # NOTE: stderr only - stdout is the MCP JSON-RPC channel
+        print(f"[warn] Could not record decision in MySQL: {exc}", file=sys.stderr)
+        return "Decision NOT recorded (database unavailable)."
+
+
+async def _record_agent_trade(
+    agent: str,
+    action: str,
+    tx_hash: str,
+    block_number: int,
+    token_in: str,
+    token_out: str,
+    amount_in: str,
+    amount_out: str,
+    quote_amount: str = "",
+    status: str = "success",
+    gas_used: int = 0,
+) -> str:
+    """Record an on-chain trade executed by the agent for PnL tracking."""
+    try:
+        await execute(
+            """
+            INSERT INTO agent_trades
+                (agentName, txHash, blockNumber, action, tokenIn, tokenOut,
+                 amountIn, amountOut, quoteAmount, status, gasUsed)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (agent, tx_hash, block_number, action, token_in, token_out,
+             amount_in, amount_out, quote_amount, status, gas_used),
+        )
+        return "Trade recorded."
+    except DatabaseUnavailable as exc:
+        print(f"[warn] Could not record trade in MySQL: {exc}", file=sys.stderr)
+        return "Trade NOT recorded (database unavailable)."
 
 
 async def _search_market_history(query_text: str, limit: int = 5) -> list[dict]:
-    """Perform vector search in Qdrant for historical market patterns."""
+    """Vector search over historical market patterns (Qdrant)."""
     return await asyncio.to_thread(vector_store.search_history, query_text, limit)
 
 
-# ── MCP Tools (Write) ────────────────────────────────────────────────────────
+async def _get_tokens() -> dict:
+    """Symbol -> address for every deployed token the agent can trade."""
+    return get_deployed_tokens()
+
+
+# ── Write tools ───────────────────────────────────────────────────────────────
+
+def _amount(value: str | int) -> int:
+    """Accept plain wei (str/int) - rejects anything non-numeric early."""
+    return int(Decimal(str(value)))
+
 
 async def _execute_trade(token_in: str, token_out: str, amount_in: str) -> dict:
-    """Execute a token swap on the blockchain."""
     try:
-        amt = int(Decimal(amount_in))
-        return await asyncio.to_thread(swap_tokens, token_in, token_out, amt)
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return await asyncio.to_thread(swap_tokens, token_in, token_out, _amount(amount_in))
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
 
 
-async def _manage_liquidity(action: str, token_a: str, token_b: str, amount_a: str = "0", amount_b: str = "0", liquidity: str = "0") -> dict:
-    """Add or remove liquidity from a pool."""
+async def _execute_arbitrage(path: list[str], amount_in: str, min_amount_out: str = "0") -> dict:
+    try:
+        return await asyncio.to_thread(
+            execute_multi_hop_swap, path, _amount(amount_in), _amount(min_amount_out)
+        )
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+async def _manage_liquidity(
+    action: str,
+    token_a: str,
+    token_b: str,
+    amount_a: str = "0",
+    amount_b: str = "0",
+    liquidity: str = "0",
+) -> dict:
     try:
         if action == "ADD":
-            amt_a = int(Decimal(amount_a))
-            amt_b = int(Decimal(amount_b))
-            return await asyncio.to_thread(add_liquidity, token_a, token_b, amt_a, amt_b)
-        elif action == "REMOVE":
-            liq = int(Decimal(liquidity))
-            return await asyncio.to_thread(remove_liquidity, token_a, token_b, liq)
-        else:
-            return {"status": "error", "message": f"Invalid action: {action}"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+            return await asyncio.to_thread(
+                add_liquidity, token_a, token_b, _amount(amount_a), _amount(amount_b)
+            )
+        if action == "REMOVE":
+            return await asyncio.to_thread(remove_liquidity, token_a, token_b, _amount(liquidity))
+        return {"status": "error", "message": f"Invalid action: {action}"}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
 
-async def _get_balances(token_addresses: list[str]) -> dict:
-    """Fetch the agent's balance for multiple tokens."""
+
+async def _get_balances(token_addresses: list[str] | None = None) -> dict:
     return await asyncio.to_thread(get_balances, token_addresses)
 
-async def _execute_arbitrage(path: list[str], amount_in: str) -> dict:
-    """Execute a multi-hop swap for arbitrage."""
-    try:
-        amt = int(Decimal(amount_in))
-        return await asyncio.to_thread(execute_multi_hop_swap, path, amt)
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+
+async def _approve(token_address: str, amount: str) -> dict:
+    from dex_mcp.config import ROUTER_ADDRESS
+
+    return await asyncio.to_thread(approve_token, token_address, ROUTER_ADDRESS, _amount(amount))
 
 
-# ── MCP Server Setup ──────────────────────────────────────────────────────────
+# ── MCP tool schema ───────────────────────────────────────────────────────────
 server = Server("dex-mcp")
 
 
@@ -237,121 +495,158 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="get_market_context",
-            description="Returns the latest reserves, spot price, and TWAP for every pair. Use as baseline before making any decision.",
+            description="Latest reserves, spot price and TWAP for every pair. Always call this first.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
+            name="get_pool_addresses",
+            description="List every trading pair with its token symbols and addresses.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="get_deployed_tokens",
+            description="Symbol -> address for every tradable token. Use these addresses in trade calls.",
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
+        types.Tool(
+            name="get_live_pool_state",
+            description="Read reserves, spot price and TWAP directly from one DexPair contract.",
+            inputSchema={
+                "type": "object",
+                "properties": {"pair_address": {"type": "string", "description": "0x DexPair address"}},
+                "required": ["pair_address"],
+            },
+        ),
+        types.Tool(
             name="get_balances",
-            description="Returns the agent's current token balances. Use to know how much you can trade.",
+            description=(
+                "The agent wallet's balances. `token_addresses` is optional: omit it to get every "
+                "deployed token. Values are human-readable (ETH/token units)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "token_addresses": {"type": "array", "items": {"type": "string"}, "description": "List of 0x token addresses"}
+                    "token_addresses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of 0x token addresses",
+                    }
                 },
-                "required": ["token_addresses"],
-            },
-        ),
-        types.Tool(
-            name="execute_arbitrage",
-            description="Execute a multi-hop swap (e.g. A -> B -> C -> A) to capture arbitrage. Requires a path of token addresses and amount in Wei.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "path": {"type": "array", "items": {"type": "string"}, "description": "Sequence of 0x token addresses"},
-                    "amount_in": {"type": "string", "description": "Amount to swap in Wei"}
-                },
-                "required": ["path", "amount_in"],
-            },
-        ),
-        types.Tool(
-            name="search_market_history",
-            description="Search historical market patterns using vector similarity (Qdrant). Use to see how the market behaved in similar past situations.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Natural language query, e.g., 'high volatility in USDC pool'"},
-                    "limit": {"type": "integer", "description": "Number of historical matches to return", "default": 5}
-                },
-                "required": ["query"],
+                "required": [],
             },
         ),
         types.Tool(
             name="execute_trade",
-            description="Execute a swap on the DEX blockchain. Requires token addresses and amount in Wei.",
+            description="Swap token_in for token_out on-chain. amount_in must be in wei (1 token = 1e18).",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "token_in": {"type": "string", "description": "0x address of input token"},
-                    "token_out": {"type": "string", "description": "0x address of output token"},
-                    "amount_in": {"type": "string", "description": "Amount to swap in Wei (as string)"}
+                    "token_in": {"type": "string"},
+                    "token_out": {"type": "string"},
+                    "amount_in": {"type": "string", "description": "wei, as a string"},
                 },
                 "required": ["token_in", "token_out", "amount_in"],
             },
         ),
         types.Tool(
+            name="execute_arbitrage",
+            description="Multi-hop swap (e.g. USDC -> DAI -> WETH -> USDC) to capture a price gap. amount_in is in wei.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "array", "items": {"type": "string"}},
+                    "amount_in": {"type": "string"},
+                    "min_amount_out": {"type": "string", "description": "Minimum acceptable output in wei"},
+                },
+                "required": ["path", "amount_in"],
+            },
+        ),
+        types.Tool(
             name="manage_liquidity",
-            description="Add or remove liquidity from a trading pair on the blockchain.",
+            description="Add or remove liquidity. Amounts are in wei.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["ADD", "REMOVE"]},
                     "token_a": {"type": "string"},
                     "token_b": {"type": "string"},
-                    "amount_a": {"type": "string", "description": "For ADD: amount of token A in Wei"},
-                    "amount_b": {"type": "string", "description": "For ADD: amount of token B in Wei"},
-                    "liquidity": {"type": "string", "description": "For REMOVE: amount of LP tokens in Wei"}
+                    "amount_a": {"type": "string"},
+                    "amount_b": {"type": "string"},
+                    "liquidity": {"type": "string", "description": "LP tokens to burn for REMOVE"},
                 },
                 "required": ["action", "token_a", "token_b"],
             },
         ),
         types.Tool(
-            name="get_recent_swaps",
-            description="Returns the last N swap events with amounts and pair addresses.",
+            name="approve_token",
+            description="Grant the router an allowance for a token (in wei). Swaps approve automatically.",
             inputSchema={
                 "type": "object",
-                "properties": {"n": {"type": "integer", "description": "Number of swaps to return (default 20)", "default": 20}},
+                "properties": {
+                    "token_address": {"type": "string"},
+                    "amount": {"type": "string"},
+                },
+                "required": ["token_address", "amount"],
+            },
+        ),
+        types.Tool(
+            name="get_recent_swaps",
+            description="The last N swaps with amounts and pair addresses (DB, live logs as fallback).",
+            inputSchema={
+                "type": "object",
+                "properties": {"n": {"type": "integer", "default": 20}},
                 "required": [],
             },
         ),
         types.Tool(
             name="get_price_trend",
-            description="Returns historical price snapshots for one pair. Use to detect trends or momentum.",
+            description="Historical price snapshots for one pair - use to detect trends and momentum.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pair_address": {"type": "string", "description": "0x address of the DexPair contract"},
-                    "n": {"type": "integer", "description": "Number of blocks to look back (default 50)", "default": 50},
+                    "pair_address": {"type": "string"},
+                    "n": {"type": "integer", "default": 50},
                 },
                 "required": ["pair_address"],
             },
         ),
         types.Tool(
             name="get_liquidity_stats",
-            description="Returns aggregated Mint/Burn event totals per pair. Use to assess pool depth and activity.",
+            description="Mint/Burn totals per pair, or live reserves when no events are indexed.",
             inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         types.Tool(
             name="get_risk_metrics",
-            description="Returns price volatility (std dev, min, max, avg) for a pair over the last 100 blocks. Use before recommending a trade.",
+            description="Price volatility (std dev, min, max, avg) for a pair over the last 100 snapshots.",
             inputSchema={
                 "type": "object",
-                "properties": {
-                    "pair_address": {"type": "string", "description": "0x address of the DexPair contract"},
-                },
+                "properties": {"pair_address": {"type": "string"}},
                 "required": ["pair_address"],
             },
         ),
         types.Tool(
-            name="record_agent_decision",
-            description="Write this agent's final decision to the database for auditability.",
+            name="search_market_history",
+            description="Vector similarity search over historical market patterns (Qdrant).",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "agent":      {"type": "string"},
-                    "action":     {"type": "string", "description": "e.g. 'ADD_LIQUIDITY', 'SWAP', 'HOLD', 'ALERT'"},
-                    "reason":     {"type": "string"},
-                    "confidence": {"type": "number", "description": "0.0 to 1.0"},
-                    "context":    {"type": "object", "description": "Key data that drove this decision"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                },
+                "required": ["query"],
+            },
+        ),
+        types.Tool(
+            name="record_agent_decision",
+            description="Write the final decision to the database for auditability.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string"},
+                    "action": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "confidence": {"type": "number"},
+                    "context": {"type": "object"},
                 },
                 "required": ["agent", "action", "reason", "confidence", "context"],
             },
@@ -361,48 +656,50 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    handlers = {
+        "get_market_context": lambda a: _get_market_context(),
+        "get_pool_addresses": lambda a: _get_pools_for_agent(),
+        "get_deployed_tokens": lambda a: _get_tokens(),
+        "get_live_pool_state": lambda a: _get_live_pool_state(a["pair_address"]),
+        "get_balances": lambda a: _get_balances(a.get("token_addresses")),
+        "execute_trade": lambda a: _execute_trade(a["token_in"], a["token_out"], a["amount_in"]),
+        "execute_arbitrage": lambda a: _execute_arbitrage(
+            a["path"], a["amount_in"], a.get("min_amount_out", "0")
+        ),
+        "manage_liquidity": lambda a: _manage_liquidity(
+            a["action"],
+            a["token_a"],
+            a["token_b"],
+            a.get("amount_a", "0"),
+            a.get("amount_b", "0"),
+            a.get("liquidity", "0"),
+        ),
+        "approve_token": lambda a: _approve(a["token_address"], a["amount"]),
+        "get_recent_swaps": lambda a: _get_recent_swaps(a.get("n", 20)),
+        "get_price_trend": lambda a: _get_price_trend(a["pair_address"], a.get("n", 50)),
+        "get_liquidity_stats": lambda a: _get_liquidity_stats(),
+        "get_risk_metrics": lambda a: _get_risk_metrics(a["pair_address"]),
+        "search_market_history": lambda a: _search_market_history(a["query"], a.get("limit", 5)),
+        "record_agent_decision": lambda a: _record_agent_decision(
+            a["agent"], a["action"], a["reason"], a["confidence"], a.get("context", {})
+        ),
+    }
+
+    handler = handlers.get(name)
+    if handler is None:
+        return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+
     try:
-        if name == "get_market_context":
-            result = await _get_market_context()
-        elif name == "get_balances":
-            result = await _get_balances(arguments["token_addresses"])
-        elif name == "execute_arbitrage":
-            result = await _execute_arbitrage(arguments["path"], arguments["amount_in"])
-        elif name == "search_market_history":
-            result = await _search_market_history(arguments["query"], arguments.get("limit", 5))
-        elif name == "execute_trade":
-            result = await _execute_trade(arguments["token_in"], arguments["token_out"], arguments["amount_in"])
-        elif name == "manage_liquidity":
-            result = await _manage_liquidity(
-                arguments["action"], arguments["token_a"], arguments["token_b"],
-                arguments.get("amount_a", "0"), arguments.get("amount_b", "0"),
-                arguments.get("liquidity", "0")
-            )
-        elif name == "get_recent_swaps":
-            result = await _get_recent_swaps(arguments.get("n", 20))
-        elif name == "get_price_trend":
-            result = await _get_price_trend(arguments["pair_address"], arguments.get("n", 50))
-        elif name == "get_liquidity_stats":
-            result = await _get_liquidity_stats()
-        elif name == "get_risk_metrics":
-            result = await _get_risk_metrics(arguments["pair_address"])
-        elif name == "record_agent_decision":
-            result = await _record_agent_decision(
-                arguments["agent"], arguments["action"],
-                arguments["reason"], arguments["confidence"],
-                arguments.get("context", {})
-            )
-        else:
-            result = {"error": f"Unknown tool: {name}"}
+        result = await handler(arguments)
+    except Exception as exc:
+        result = {"error": str(exc)}
 
-        return [types.TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
-
-    except Exception as e:
-        return [types.TextContent(type="text", text=json.dumps({"error": str(e)}))]
+    return [types.TextContent(type="text", text=json.dumps(result, default=str, indent=2))]
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
 async def main():
+    # Diagnostics go to stderr: stdout carries the MCP protocol frames.
+    print(describe(), file=sys.stderr, flush=True)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 

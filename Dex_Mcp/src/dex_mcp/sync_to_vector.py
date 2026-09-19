@@ -1,35 +1,57 @@
+"""
+Mirrors pair_snapshots from MySQL into the Qdrant vector store so the agents can
+recall similar historical market situations.
+
+Usage: uv run dex-vectors   (or: uv run python -m dex_mcp.sync_to_vector)
+"""
+
+from __future__ import annotations
+
 import asyncio
-import os
+
 import aiomysql
-from dotenv import load_dotenv
+
+from dex_mcp.config import DB_CONFIG
 from dex_mcp.Vector_Store import vector_store
 
-load_dotenv()
 
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
-    "user":     os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "db":       os.getenv("DB_NAME"),
-}
-
-async def sync_mysql_to_qdrant():
-    print("Starting MySQL to Qdrant synchronization...")
-    
+async def sync_mysql_to_qdrant(limit: int | None = None) -> int:
     conn = await aiomysql.connect(**DB_CONFIG)
-    async with conn.cursor(aiomysql.DictCursor) as cur:
-        # Fetch all snapshots
-        await cur.execute("SELECT * FROM pair_snapshots")
-        snapshots = await cur.fetchall()
-        
-        print(f"Found {len(snapshots)} snapshots to sync.")
-        
-        for i, snapshot in enumerate(snapshots):
-            print(f"[{i+1}/{len(snapshots)}] Syncing snapshot {snapshot['id']} (Block {snapshot['blockNumber']})...")
-            await vector_store.upsert_snapshot(snapshot)
-            
-    conn.close()
-    print("Synchronization complete!")
+    synced = 0
+
+    try:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            sql = "SELECT * FROM pair_snapshots ORDER BY blockNumber DESC"
+            if limit:
+                sql += f" LIMIT {int(limit)}"
+            try:
+                await cur.execute(sql)
+                snapshots = await cur.fetchall()
+            except Exception as exc:
+                print(f"Cannot read pair_snapshots: {exc}")
+                print("Run `npm run db:init` and `npm run index` first.")
+                return 0
+
+            total = len(snapshots)
+            print(f"Found {total} snapshots to sync.")
+
+            for index, snapshot in enumerate(snapshots, start=1):
+                print(f"[{index}/{total}] snapshot {snapshot['id']} (block {snapshot['blockNumber']})")
+                try:
+                    if await asyncio.to_thread(vector_store.upsert_snapshot, snapshot):
+                        synced += 1
+                except Exception as exc:
+                    print(f"  skipped: {exc}")
+    finally:
+        conn.close()
+
+    print(f"Synced {synced}/{total if 'total' in locals() else 0} snapshots into Qdrant.")
+    return synced
+
+
+def main() -> None:
+    asyncio.run(sync_mysql_to_qdrant())
+
 
 if __name__ == "__main__":
-    asyncio.run(sync_mysql_to_qdrant())
+    main()
