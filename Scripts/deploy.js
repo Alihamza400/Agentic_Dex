@@ -11,14 +11,14 @@ async function main() {
   console.log(`Deploying to network "${net.name}" (chainId ${net.chainId}) as ${deployer.address}`);
 
   console.log("Deploying Factory...");
-  const Factory = await ethers.deployContract("DexFactory");
+  const Factory = await ethers.deployContract("DexFactory", [deployer.address]);
   await Factory.waitForDeployment();
   const factoryAddress = await Factory.getAddress();
   console.log("Factory deployed at:", factoryAddress);
   saveAddress("DexFactory", factoryAddress);
 
   console.log("Deploying Router...");
-  const Router = await ethers.deployContract("DexRouter", [factoryAddress]);
+  const Router = await ethers.deployContract("DexRouter", [factoryAddress, deployer.address]);
   await Router.waitForDeployment();
   const routerAddress = await Router.getAddress();
   console.log("Router deployed at:", routerAddress);
