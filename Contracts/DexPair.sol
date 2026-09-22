@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "./Token/LP_Token.sol";
 import "./interfaces/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /* ------------------------------------------------------------- */
 /* ----------- Fixed Point Library (from Uniswap V2) ----------- */
@@ -20,7 +21,7 @@ library UQ112x112 {
     }
 }
 
-contract DexPair is ReentrancyGuard {
+contract DexPair is ReentrancyGuard, Pausable {
     address public token0;
     address public token1;
     LPToken public lpToken;
@@ -30,15 +31,28 @@ contract DexPair is ReentrancyGuard {
 
     bool private initialized = false;
 
+    // Minimum liquidity to lock forever (prevents first-LP attack)
+    uint256 public constant MINIMUM_LIQUIDITY = 1000;
+
     // -------- Oracle Variables --------
     uint256 public price0CumulativeLast;
     uint256 public price1CumulativeLast;
     uint32  public blockTimestampLast;
 
+    // -------- Pauser Role --------
+    address public pauser;
+    bool private _notEntered = true;
+
     event Mint(address indexed provider, uint amount0, uint amount1, uint liquidity);
     event Burn(address indexed provider, uint amount0, uint amount1, uint liquidity);
     event Swap(address indexed sender, uint amountIn, uint amountOut);
     event Sync(uint112 reserve0, uint112 reserve1, uint256 price0Cumulative, uint256 price1Cumulative);
+    event PauserUpdated(address indexed oldPauser, address indexed newPauser);
+
+    modifier onlyPauser() {
+        require(msg.sender == pauser, "DexPair: NOT_PAUSER");
+        _;
+    }
 
     // -------- Initialize Pair --------
     function initialize(address _token0, address _token1) external {
@@ -49,12 +63,31 @@ contract DexPair is ReentrancyGuard {
         token0 = _token0;
         token1 = _token1;
 
-        lpToken = new LPToken("LP Token", "LPT");
+        // Create LP token with pair address suffix for uniqueness
+        bytes20 token0Suffix = bytes20(_token0);
+        bytes20 token1Suffix = bytes20(_token1);
+        lpToken = new LPToken("Dex LP Token", "DexLP");
 
+        pauser = msg.sender;
         initialized = true;
 
         // initialize timestamp
         blockTimestampLast = uint32(block.timestamp % 2**32);
+    }
+
+    // -------- Emergency Pause --------
+    function pause() external onlyPauser {
+        _pause();
+    }
+
+    function unpause() external onlyPauser {
+        _unpause();
+    }
+
+    function setPauser(address _pauser) external onlyPauser {
+        require(_pauser != address(0), "Zero address");
+        emit PauserUpdated(pauser, _pauser);
+        pauser = _pauser;
     }
 
     // -------- Get Reserves --------
@@ -86,7 +119,7 @@ contract DexPair is ReentrancyGuard {
     }
 
     // -------- Add Liquidity --------
-    function addLiquidity(uint amount0, uint amount1, address to) external nonReentrant returns (uint liquidity) {
+    function addLiquidity(uint amount0, uint amount1, address to) external nonReentrant whenNotPaused returns (uint liquidity) {
         require(initialized, "Not initialized");
         require(amount0 > 0 && amount1 > 0, "Invalid amounts");
 
@@ -94,6 +127,10 @@ contract DexPair is ReentrancyGuard {
 
         if (_r0 == 0 && _r1 == 0) {
             liquidity = sqrt(amount0 * amount1);
+            // Lock MINIMUM_LIQUIDITY tokens forever (first-LP attack prevention)
+            require(liquidity > MINIMUM_LIQUIDITY, "Insufficient initial liquidity");
+            lpToken._mint(address(0xdead), MINIMUM_LIQUIDITY);
+            liquidity -= MINIMUM_LIQUIDITY;
         } else {
             uint _totalSupply = lpToken.totalSupply();
             uint liquidity0 = (amount0 * _totalSupply) / _r0;
@@ -105,6 +142,9 @@ contract DexPair is ReentrancyGuard {
 
         lpToken._mint(to, liquidity);
 
+        // Safe casting with bounds check
+        require(_r0 + amount0 <= type(uint112).max, "DexPair: OVERFLOW_R0");
+        require(_r1 + amount1 <= type(uint112).max, "DexPair: OVERFLOW_R1");
         _update(_r0 + uint112(amount0), _r1 + uint112(amount1));
 
         emit Mint(msg.sender, amount0, amount1, liquidity);
@@ -116,6 +156,7 @@ contract DexPair is ReentrancyGuard {
     function removeLiquidity(uint liquidity, address to)
         external 
         nonReentrant
+        whenNotPaused
         returns (uint amount0, uint amount1) 
     {
         require(initialized, "Not initialized");
@@ -131,6 +172,9 @@ contract DexPair is ReentrancyGuard {
 
         lpToken._burn(address(this), liquidity);
 
+        // Safe casting with bounds check
+        require(_r0 >= amount0, "DexPair: UNDERFLOW_R0");
+        require(_r1 >= amount1, "DexPair: UNDERFLOW_R1");
         _update(_r0 - uint112(amount0), _r1 - uint112(amount1));
 
         IERC20(token0).transfer(to, amount0);
@@ -143,6 +187,7 @@ contract DexPair is ReentrancyGuard {
     function swap(uint amountIn, address tokenIn, address to)
         external 
         nonReentrant
+        whenNotPaused
         returns (uint amountOut) 
     {
         require(initialized, "Not initialized");
@@ -162,10 +207,16 @@ contract DexPair is ReentrancyGuard {
         if (isToken0) {
             amountOut = getAmountOut(amountIn, uint(r0), uint(r1));
             IERC20(token1).transfer(to, amountOut);
+            // Safe casting with bounds check
+            require(r0 + amountIn <= type(uint112).max, "DexPair: OVERFLOW_R0");
+            require(r1 >= amountOut, "DexPair: UNDERFLOW_R1");
             _update(r0 + uint112(amountIn), r1 - uint112(amountOut));
         } else {
             amountOut = getAmountOut(amountIn, uint(r1), uint(r0));
             IERC20(token0).transfer(to, amountOut);
+            // Safe casting with bounds check
+            require(r1 + amountIn <= type(uint112).max, "DexPair: OVERFLOW_R1");
+            require(r0 >= amountOut, "DexPair: UNDERFLOW_R0");
             _update(r0 - uint112(amountOut), r1 + uint112(amountIn));
         }
 
@@ -191,7 +242,7 @@ contract DexPair is ReentrancyGuard {
         price1 = (uint(reserve0) * 1e18) / reserve1;
     }
 
-    function getTWAP() external view returns (uint price0Cum, uint price1Cum) {
+    function getTWAP() external view returns (uint price0Cum, uint1Cum) {
         return (price0CumulativeLast, price1CumulativeLast);
     }
 

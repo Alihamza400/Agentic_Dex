@@ -4,17 +4,28 @@ pragma solidity ^0.8.20;
 import "./DexFactory.sol";
 import "./DexPair.sol";
 import "./interfaces/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
-contract DexRouter {
+contract DexRouter is Ownable, Pausable {
     DexFactory public factory;
 
-    constructor(address _factory) {
+    constructor(address _factory, address _owner) Ownable(_owner) {
         factory = DexFactory(_factory);
     }
 
     modifier ensure(uint deadline) {
         require(deadline >= block.timestamp, "DexRouter: EXPIRED");
         _;
+    }
+
+    // -------- Emergency Controls --------
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // ---------------- Add Liquidity ----------------
@@ -24,7 +35,7 @@ contract DexRouter {
         uint amountADesired,
         uint amountBDesired,
         uint deadline
-    ) external ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+    ) external ensure(deadline) whenNotPaused returns (uint amountA, uint amountB, uint liquidity) {
         require(tokenA != tokenB, "DexRouter: IDENTICAL_TOKENS");
         require(amountADesired > 0 && amountBDesired > 0, "DexRouter: ZERO_AMOUNT");
 
@@ -70,7 +81,7 @@ contract DexRouter {
         uint amountAMin,
         uint amountBMin,
         uint deadline
-    ) external ensure(deadline) returns (uint amountA, uint amountB) {
+    ) external ensure(deadline) whenNotPaused returns (uint amountA, uint amountB) {
         address pair = factory.getPair(tokenA, tokenB);
         require(pair != address(0), "Pair doesn't exist");
         require(liquidity > 0, "DexRouter: ZERO_LIQUIDITY");
@@ -96,7 +107,7 @@ contract DexRouter {
         uint amountIn,
         uint minAmountOut,
         uint deadline
-    ) external ensure(deadline) returns (uint amountOut) {
+    ) external ensure(deadline) whenNotPaused returns (uint amountOut) {
         address pair = factory.getPair(tokenIn, tokenOut);
         require(pair != address(0), "Pair doesn't exist");
 
@@ -114,7 +125,7 @@ contract DexRouter {
         uint minAmountOut,
         address[] calldata path,
         uint deadline
-    ) external ensure(deadline) returns (uint[] memory amounts) {
+    ) external ensure(deadline) whenNotPaused returns (uint[] memory amounts) {
         require(path.length >= 2, "Invalid path");
 
         amounts = new uint[](path.length);
