@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Web3Provider } from './context/Web3Context';
@@ -17,12 +17,127 @@ import TokenFaucet from './components/TokenFaucet';
 import { ToastContainer } from 'react-toastify';
 import 'react-toastify/dist/ReactToastify.css';
 
+const API_BASE = 'http://127.0.0.1:8000';
+
+// Hook to fetch real dashboard stats
+function useDashboardStats() {
+  const [stats, setStats] = useState({
+    tvl: 0,
+    volume24h: 0,
+    activePools: 0,
+    newPools24h: 0,
+    agentStats: {
+      activeStrategies: 0,
+      tradesExecuted: 0,
+      successRate: 0,
+      totalProfit: 0,
+    },
+    recentActivity: [],
+    loading: true,
+    error: null,
+  });
+
+  const fetchStats = useCallback(async () => {
+    try {
+      // Fetch agent status (includes analytics)
+      const statusRes = await fetch(`${API_BASE}?action=get_status`);
+      const statusData = await statusRes.json();
+
+      // Fetch market data (pools)
+      const marketRes = await fetch(`${API_BASE}?action=get_market`);
+      const marketData = await marketRes.json();
+
+      // Fetch recent decisions
+      const decisionsRes = await fetch(`${API_BASE}?action=get_decisions&limit=10`);
+      const decisionsData = await decisionsRes.json();
+
+      // Calculate real stats from market data
+      const pools = marketData.pools || [];
+      let totalTvl = 0;
+      let totalVolume = 0;
+
+      pools.forEach(pool => {
+        try {
+          const r0 = parseFloat(pool.reserve0 || '0');
+          const r1 = parseFloat(pool.reserve1 || '1');
+          // Simple TVL estimate (reserves * price)
+          totalTvl += r0 + r1;
+        } catch {
+          // skip invalid pools
+        }
+      });
+
+      // Get recent swaps for volume estimate
+      const swaps = marketData.recentSwaps || [];
+      swaps.forEach(swap => {
+        try {
+          const data = JSON.parse(swap.data || '{}');
+          totalVolume += parseFloat(data.amountIn || '0');
+        } catch {
+          // skip invalid swaps
+        }
+      });
+
+      const analytics = statusData.analytics || {};
+      const decisions = decisionsData.decisions || [];
+
+      // Build recent activity from decisions
+      const recentActivity = decisions
+        .filter(d => !['HOLD', 'QUANT_ANALYSIS', 'ANALYSIS_COMPLETE', 'LOOP_COMPLETE', 'CONFIG_UPDATE'].includes(d.action))
+        .slice(0, 5)
+        .map(d => ({
+          action: d.action,
+          reason: d.reason?.substring(0, 100) || '',
+          confidence: d.confidence,
+          timestamp: d.createdAt,
+        }));
+
+      setStats({
+        tvl: totalTvl,
+        volume24h: totalVolume,
+        activePools: pools.length,
+        newPools24h: 0,
+        agentStats: {
+          activeStrategies: statusData.config?.is_active ? 1 : 0,
+          tradesExecuted: analytics.trades || 0,
+          successRate: analytics.successRate || 0,
+          totalProfit: analytics.profit || 0,
+        },
+        recentActivity,
+        loading: false,
+        error: null,
+      });
+    } catch (err) {
+      setStats(prev => ({
+        ...prev,
+        loading: false,
+        error: err.message,
+      }));
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchStats();
+    const interval = setInterval(fetchStats, 10000); // Refresh every 10s
+    return () => clearInterval(interval);
+  }, [fetchStats]);
+
+  return stats;
+}
+
 
 // Main App Component
 function AppContent() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const location = useLocation();
   const isActive = (path) => location.pathname === path;
+  const stats = useDashboardStats();
+
+  const formatNumber = (num) => {
+    if (num >= 1000000) return `$${(num / 1000000).toFixed(1)}M`;
+    if (num >= 1000) return `$${(num / 1000).toFixed(1)}K`;
+    return `$${num.toFixed(0)}`;
+  };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-purple-900">
@@ -306,9 +421,13 @@ function AppContent() {
                         transition={{ delay: 0.4 }}
                         className="bg-gradient-to-br from-cyan-600/20 to-blue-600/20 rounded-xl p-6 border border-cyan-500/30 backdrop-blur-sm"
                       >
-                        <h3 className="text-lg font-semibold text-cyan-300 mb-2">Total Value Locked <span className="text-[10px] opacity-60">(Simulated)</span></h3>
-                        <p className="text-3xl font-bold text-white">$1.2M</p>
-                        <div className="text-sm text-green-400 mt-1">+12.5% (24h)</div>
+                        <h3 className="text-lg font-semibold text-cyan-300 mb-2">Total Value Locked</h3>
+                        <p className="text-3xl font-bold text-white">
+                          {stats.loading ? '...' : formatNumber(stats.tvl)}
+                        </p>
+                        <div className="text-sm text-gray-400 mt-1">
+                          {stats.error ? 'Backend offline' : `${stats.activePools} pools tracked`}
+                        </div>
                       </motion.div>
                       <motion.div
                         initial={{ opacity: 0, scale: 0.9 }}
@@ -316,9 +435,13 @@ function AppContent() {
                         transition={{ delay: 0.5 }}
                         className="bg-gradient-to-br from-green-600/20 to-emerald-600/20 rounded-xl p-6 border border-green-500/30 backdrop-blur-sm"
                       >
-                        <h3 className="text-lg font-semibold text-green-300 mb-2">24h Volume <span className="text-[10px] opacity-60">(Simulated)</span></h3>
-                        <p className="text-3xl font-bold text-white">$456K</p>
-                        <div className="text-sm text-green-400 mt-1">+8.3% (24h)</div>
+                        <h3 className="text-lg font-semibold text-green-300 mb-2">Recent Volume</h3>
+                        <p className="text-3xl font-bold text-white">
+                          {stats.loading ? '...' : formatNumber(stats.volume24h)}
+                        </p>
+                        <div className="text-sm text-gray-400 mt-1">
+                          From recent swaps
+                        </div>
                       </motion.div>
                       <motion.div
                         initial={{ opacity: 0, scale: 0.9 }}
@@ -327,8 +450,12 @@ function AppContent() {
                         className="bg-gradient-to-br from-purple-600/20 to-pink-600/20 rounded-xl p-6 border border-purple-500/30 backdrop-blur-sm"
                       >
                         <h3 className="text-lg font-semibold text-purple-300 mb-2">Active Pools</h3>
-                        <p className="text-3xl font-bold text-white">24</p>
-                        <div className="text-sm text-blue-400 mt-1">+3 New (24h)</div>
+                        <p className="text-3xl font-bold text-white">
+                          {stats.loading ? '...' : stats.activePools}
+                        </p>
+                        <div className="text-sm text-gray-400 mt-1">
+                          Trading pairs available
+                        </div>
                       </motion.div>
                     </div>
 
@@ -349,19 +476,23 @@ function AppContent() {
                         <div className="space-y-3">
                           <div className="flex justify-between">
                             <span className="text-gray-400">Active Strategies</span>
-                            <span className="text-white font-medium">3</span>
+                            <span className="text-white font-medium">{stats.agentStats.activeStrategies}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-gray-400">Trades Executed</span>
-                            <span className="text-white font-medium">1,247</span>
+                            <span className="text-white font-medium">{stats.agentStats.tradesExecuted.toLocaleString()}</span>
                           </div>
                           <div className="flex justify-between">
                             <span className="text-gray-400">Success Rate</span>
-                            <span className="text-green-400 font-medium">78.5%</span>
+                            <span className={`font-medium ${stats.agentStats.successRate >= 50 ? 'text-green-400' : 'text-yellow-400'}`}>
+                              {stats.agentStats.successRate}%
+                            </span>
                           </div>
                           <div className="flex justify-between">
-                            <span className="text-gray-400">Total Profit</span>
-                            <span className="text-green-400 font-medium">$2,345.67</span>
+                            <span className="text-gray-400">Total PnL</span>
+                            <span className={`font-medium ${stats.agentStats.totalProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                              {stats.agentStats.totalProfit >= 0 ? '+' : ''}{stats.agentStats.totalProfit.toFixed(2)}%
+                            </span>
                           </div>
                         </div>
                       </motion.div>
@@ -374,27 +505,27 @@ function AppContent() {
                       >
                         <h3 className="text-xl font-semibold text-white mb-4">Recent Activity</h3>
                         <div className="space-y-3">
-                          <div className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg">
-                            <div className="flex items-center">
-                              <div className="w-2 h-2 bg-green-500 rounded-full mr-3"></div>
-                              <span className="text-white">ETH/USDC Swap</span>
+                          {stats.recentActivity.length > 0 ? (
+                            stats.recentActivity.map((activity, i) => (
+                              <div key={i} className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg">
+                                <div className="flex items-center">
+                                  <div className={`w-2 h-2 rounded-full mr-3 ${
+                                    activity.action === 'TRADE' ? 'bg-green-500' :
+                                    activity.action === 'ADD_LIQUIDITY' ? 'bg-blue-500' :
+                                    'bg-purple-500'
+                                  }`}></div>
+                                  <span className="text-white text-sm">{activity.action}</span>
+                                </div>
+                                <span className="text-gray-400 text-xs">
+                                  {activity.confidence ? `${(activity.confidence * 100).toFixed(0)}%` : ''}
+                                </span>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="text-center text-gray-500 py-4">
+                              No recent activity
                             </div>
-                            <span className="text-green-400">+$120.50</span>
-                          </div>
-                          <div className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg">
-                            <div className="flex items-center">
-                              <div className="w-2 h-2 bg-blue-500 rounded-full mr-3"></div>
-                              <span className="text-white">BTC/USDT Liquidity</span>
-                            </div>
-                            <span className="text-blue-400">+$45.23</span>
-                          </div>
-                          <div className="flex items-center justify-between p-3 bg-gray-700/30 rounded-lg">
-                            <div className="flex items-center">
-                              <div className="w-2 h-2 bg-purple-500 rounded-full mr-3"></div>
-                              <span className="text-white">AI Arbitrage</span>
-                            </div>
-                            <span className="text-purple-400">+$78.91</span>
-                          </div>
+                          )}
                         </div>
                       </motion.div>
                     </div>
