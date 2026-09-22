@@ -461,7 +461,38 @@ def get_deployed_tokens() -> dict:
             for symbol, meta in load_tokens().items()}
 
 
-# ── Trade recording (async helper) ───────────────────────────────────────────
+# ── PnL Calculation ───────────────────────────────────────────────────────────
+
+def _calculate_pnl(
+    token_in: str,
+    token_out: str,
+    amount_in: int,
+    amount_out: int,
+    quote_amount: int,
+) -> float:
+    """Calculate profit/loss for a trade.
+
+    PnL logic:
+    - For swaps: PnL = (quote_amount - amount_out) / quote_amount * 100
+      (positive = got more than expected, negative = slippage loss)
+    - For arbitrage: PnL = (amount_out - amount_in) / amount_in * 100
+      (positive = profit, negative = loss)
+    - Gas cost is tracked separately
+
+    Returns PnL as a percentage (e.g., 0.5 means +0.5%).
+    """
+    if amount_in <= 0:
+        return 0.0
+
+    # Use quote as baseline if available, otherwise use amount_in
+    baseline = quote_amount if quote_amount > 0 else amount_in
+
+    if baseline <= 0:
+        return 0.0
+
+    pnl = ((amount_out - baseline) / baseline) * 100.0
+    return round(pnl, 4)
+
 
 def _record_trade_async(
     agent: str,
@@ -476,9 +507,19 @@ def _record_trade_async(
     status: str = "success",
     gas_used: int = 0,
 ) -> None:
-    """Fire-and-forget trade recording. Never blocks the caller."""
+    """Fire-and-forget trade recording with PnL calculation. Never blocks the caller."""
     import asyncio
     from dex_mcp.MCP_Server import _record_agent_trade
+
+    # Calculate PnL
+    pnl = 0.0
+    try:
+        amount_in_int = int(amount_in) if amount_in else 0
+        amount_out_int = int(amount_out) if amount_out else 0
+        quote_int = int(quote_amount) if quote_amount else 0
+        pnl = _calculate_pnl(token_in, token_out, amount_in_int, amount_out_int, quote_int)
+    except (ValueError, TypeError):
+        pass
 
     async def _do_record():
         await _record_agent_trade(
@@ -493,6 +534,7 @@ def _record_trade_async(
             quote_amount=quote_amount,
             status=status,
             gas_used=gas_used,
+            pnl=pnl,
         )
 
     try:

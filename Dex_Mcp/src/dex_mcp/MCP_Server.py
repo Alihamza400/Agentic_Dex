@@ -410,6 +410,7 @@ async def _record_agent_trade(
     quote_amount: str = "",
     status: str = "success",
     gas_used: int = 0,
+    pnl: float = 0.0,
 ) -> str:
     """Record an on-chain trade executed by the agent for PnL tracking."""
     try:
@@ -417,16 +418,59 @@ async def _record_agent_trade(
             """
             INSERT INTO agent_trades
                 (agentName, txHash, blockNumber, action, tokenIn, tokenOut,
-                 amountIn, amountOut, quoteAmount, status, gasUsed)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 amountIn, amountOut, quoteAmount, status, gasUsed, pnl)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (agent, tx_hash, block_number, action, token_in, token_out,
-             amount_in, amount_out, quote_amount, status, gas_used),
+             amount_in, amount_out, quote_amount, status, gas_used, pnl),
         )
         return "Trade recorded."
     except DatabaseUnavailable as exc:
         print(f"[warn] Could not record trade in MySQL: {exc}", file=sys.stderr)
         return "Trade NOT recorded (database unavailable)."
+
+
+async def _get_pnl_summary(agent: str = "Quant_Orchestrator") -> dict:
+    """Get PnL summary for the agent: total trades, wins, losses, total PnL, win rate."""
+
+    async def live():
+        return {
+            "totalTrades": 0,
+            "winningTrades": 0,
+            "losingTrades": 0,
+            "totalPnl": 0.0,
+            "winRate": 0.0,
+            "avgPnl": 0.0,
+            "bestTrade": 0.0,
+            "worstTrade": 0.0,
+            "note": "No database available. Run npm run index to enable PnL tracking.",
+        }
+
+    try:
+        rows = await try_db(
+            query(
+                """
+                SELECT
+                    COUNT(*) AS totalTrades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS winningTrades,
+                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losingTrades,
+                    SUM(CASE WHEN status = 'success' THEN pnl ELSE 0 END) AS totalPnl,
+                    AVG(CASE WHEN status = 'success' THEN pnl END) AS avgPnl,
+                    MAX(CASE WHEN status = 'success' THEN pnl END) AS bestTrade,
+                    MIN(CASE WHEN status = 'success' THEN pnl END) AS worstTrade
+                FROM agent_trades
+                WHERE agentName = %s AND status = 'success'
+                """,
+                (agent,),
+            ),
+            live,
+        )
+    except DatabaseUnavailable:
+        return await live()
+
+    if isinstance(rows, dict):
+        return rows
+    return rows[0] if rows else await live()
 
 
 async def _search_market_history(query_text: str, limit: int = 5) -> list[dict]:
@@ -657,6 +701,21 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["agent", "action", "reason", "confidence", "context"],
             },
         ),
+        types.Tool(
+            name="get_pnl_summary",
+            description="Get profit/loss summary for agent trades: total trades, wins, losses, win rate, total PnL.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Agent name (default: Quant_Orchestrator)",
+                        "default": "Quant_Orchestrator",
+                    }
+                },
+                "required": [],
+            },
+        ),
     ]
 
 
@@ -689,6 +748,7 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         "record_agent_decision": lambda a: _record_agent_decision(
             a["agent"], a["action"], a["reason"], a["confidence"], a.get("context", {})
         ),
+        "get_pnl_summary": lambda a: _get_pnl_summary(a.get("agent", "Quant_Orchestrator")),
     }
 
     handler = handlers.get(name)

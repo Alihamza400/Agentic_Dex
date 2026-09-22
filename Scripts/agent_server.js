@@ -46,9 +46,13 @@ const tokens = loadJson(join(PROJECT_ROOT, "frontend/src/constants/deployedToken
 
 // ── Provider + wallet ─────────────────────────────────────────────────
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:7545";
-const PRIVATE_KEY =
-  process.env.PRIVATE_KEY ||
-  "0xbc9cb91597c456ba71ac42f366417893e4f55d6c2631b479c446314befc854b4";
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+
+if (!PRIVATE_KEY) {
+  console.error("CRITICAL: PRIVATE_KEY environment variable is not set.");
+  console.error("Set it in your .env file or export it: export PRIVATE_KEY=0x...");
+  process.exit(1);
+}
 
 const provider = new JsonRpcProvider(RPC_URL);
 const wallet = new Wallet(PRIVATE_KEY, provider);
@@ -225,13 +229,67 @@ async function getRecentSwaps(limit = 20) {
   return swaps.sort((a, b) => b.blockNumber - a.blockNumber).slice(0, limit);
 }
 
+// ── Security Configuration ─────────────────────────────────────────────
+const ALLOWED_ORIGINS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",")
+  : ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"];
+
+// Rate limiting: simple in-memory implementation
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = 100; // per window
+const FAUCET_RATE_LIMIT_MAX = 10; // stricter limit for faucet
+
+function checkRateLimit(ip, action) {
+  const key = `${ip}:${action}`;
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+
+  if (!rateLimitMap.has(key)) {
+    rateLimitMap.set(key, []);
+  }
+
+  const timestamps = rateLimitMap.get(key);
+  // Remove old timestamps outside the window
+  const validTimestamps = timestamps.filter(t => t > windowStart);
+  rateLimitMap.set(key, validTimestamps);
+
+  const maxRequests = action === "faucet" ? FAUCET_RATE_LIMIT_MAX : RATE_LIMIT_MAX_REQUESTS;
+  if (validTimestamps.length >= maxRequests) {
+    return false;
+  }
+
+  validTimestamps.push(now);
+  return true;
+}
+
+// Clean up rate limit map every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+  for (const [key, timestamps] of rateLimitMap.entries()) {
+    const valid = timestamps.filter(t => t > windowStart);
+    if (valid.length === 0) {
+      rateLimitMap.delete(key);
+    } else {
+      rateLimitMap.set(key, valid);
+    }
+  }
+}, 300_000);
+
 // ── API handler ───────────────────────────────────────────────────────
-function respond(res, payload) {
-  res.writeHead(200, {
+function respond(res, payload, statusCode = 200) {
+  const origin = res.req?.headers?.origin || "";
+  const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+
+  res.writeHead(statusCode, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
   });
   res.end(JSON.stringify(payload));
 }
@@ -253,16 +311,26 @@ function parseBody(req) {
 async function handleRequest(req, res) {
   // CORS preflight
   if (req.method === "OPTIONS") {
+    const origin = req.headers.origin || "";
+    const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": allowedOrigin,
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Max-Age": "86400",
     });
     return res.end();
   }
 
+  // Rate limiting
+  const clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
   const url = new URL(req.url, `http://${req.headers.host}`);
   let action = url.searchParams.get("action") || "get_status";
+
+  if (!checkRateLimit(clientIp, action)) {
+    respond(res, { status: "error", message: "Rate limit exceeded. Please try again later." }, 429);
+    return;
+  }
   const state = loadState();
 
   // Handle compound actions like "get_decisions&limit=20"
@@ -285,7 +353,7 @@ async function handleRequest(req, res) {
 
         const executedActions = state.decisions.filter(
           (d) =>
-            !["HOLD", "QUANT_ANALYSIS", "ANALYSIS_COMPLETE", "LOOP_COMPLETE"].includes(
+            !["HOLD", "QUANT_ANALYSIS", "ANALYSIS_COMPLETE", "LOOP_COMPLETE", "CONFIG_UPDATE"].includes(
               d.action
             )
         ).length;
@@ -301,6 +369,18 @@ async function handleRequest(req, res) {
           0
         );
 
+        // Compute real success rate from trades
+        const totalTrades = successfulTrades + failedTrades;
+        const successRate = totalTrades > 0
+          ? Math.round((successfulTrades / totalTrades) * 1000) / 10
+          : 0;
+
+        // Compute total profit from PnL
+        const totalProfit = state.trades.reduce(
+          (sum, t) => sum + (t.pnl || 0),
+          0
+        );
+
         respond(res, {
           status: "success",
           latestDecision,
@@ -310,9 +390,9 @@ async function handleRequest(req, res) {
             successfulTrades,
             failedTrades,
             decisions: state.decisions.length,
-            profit: null,
+            profit: Math.round(totalProfit * 100) / 100,
             totalGasUsed,
-            successRate: state.decisions.length > 0 ? 78.5 : 0,
+            successRate,
           },
         });
         break;
@@ -373,6 +453,43 @@ async function handleRequest(req, res) {
         respond(res, {
           status: "success",
           decisions: state.decisions.slice(-limit).reverse(),
+        });
+        break;
+      }
+
+      // ── record_trade ───────────────────────────────────────────
+      case "record_trade": {
+        const body = await parseBody(req);
+        const trade = {
+          agentName: body.agentName || "Quant_Orchestrator",
+          txHash: body.txHash || "",
+          blockNumber: body.blockNumber || 0,
+          action: body.action || "SWAP",
+          tokenIn: body.tokenIn || "",
+          tokenOut: body.tokenOut || "",
+          amountIn: body.amountIn || "0",
+          amountOut: body.amountOut || "0",
+          status: body.status || "success",
+          gasUsed: body.gasUsed || 0,
+          pnl: body.pnl || 0,
+          createdAt: new Date().toISOString(),
+        };
+        state.trades.push(trade);
+        // Keep only last 500 trades
+        if (state.trades.length > 500) {
+          state.trades = state.trades.slice(-500);
+        }
+        saveState(state);
+        respond(res, { status: "success", message: "Trade recorded", trade });
+        break;
+      }
+
+      // ── get_trades ──────────────────────────────────────────────
+      case "get_trades": {
+        const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit")) || 20));
+        respond(res, {
+          status: "success",
+          trades: state.trades.slice(-limit).reverse(),
         });
         break;
       }
